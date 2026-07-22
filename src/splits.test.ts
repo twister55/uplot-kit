@@ -734,6 +734,40 @@ describe('splitsForStep', () => {
 		]);
 	});
 
+	it('ticks a grid point whose bound was computed by different arithmetic', () => {
+		// the tick and the bound mean the same thing but reached the comparison different ways:
+		// the grid's own `27 * 0.089` is 2.403, while a range end built as `7 * st + 20 * st` is
+		// 2.4029999999999996 — one ulp lower, and respelling the tick cannot bridge that
+		const step = 0.089;
+		const scaleMin = 7 * step;
+		const scaleMax = scaleMin + 20 * step;
+
+		const result = splitsForStep({ step })(fakeSelf(), 0, scaleMin, scaleMax, 0, 0);
+
+		expect(result.length).toBe(21);
+		expect(result.at(-1)).toBe(27 * step);
+
+		// the same thing at the other end, where the bound lands an ulp *above* the point it
+		// means to include: 11 * 0.007 + 20 * 0.007 is 0.21700000000000003, the grid's 31 * 0.007
+		// is 0.217
+		const fine = 0.007;
+		const composed = 11 * fine + 20 * fine;
+		const fromBelow = splitsForStep({ step: fine })(
+			fakeSelf(),
+			0,
+			composed,
+			composed + 5 * fine,
+			0,
+			0
+		);
+
+		expect(fromBelow.length).toBe(6);
+		expect(fromBelow[0]).toBe(31 * fine);
+
+		// and a point genuinely past the end is still refused, ulp tolerance or not
+		expect(splitsForStep({ step: 0.1 })(fakeSelf(), 0, 0, 0.95, 0, 0).at(-1)).toBe(0.9);
+	});
+
 	it('never emits negative zero for a grid phased across the origin', () => {
 		// 0.3 + (-3) * 0.1 is -5.55e-17, which rounds to `-0` and formats as "-0" through
 		// Intl — the tick the caller means is 0

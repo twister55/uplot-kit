@@ -231,26 +231,50 @@ function roundSignificant(value: number): number {
 	return Number.isFinite(value) ? Number(value.toPrecision(SIGNIFICANT_DIGITS)) : value;
 }
 
+// Whether two doubles denote the same axis position. They routinely do not compare equal while
+// meaning the same thing, because the same quantity reached them by different arithmetic: a grid
+// point computed as `27 * 0.089` is 2.403, while the bound reached as `7 * 0.089 + 20 * 0.089` is
+// 2.4029999999999996 — one ulp apart, one position. Bit equality is the wrong test for anything
+// that has to decide whether a tick coincides with something, so both callers use this instead:
+// stepGrid to tell a tick sitting *on* a bound from one past it, mergeTicks to keep an injected
+// edge from being drawn a sub-pixel away from the tick it duplicates.
+//
+// The tolerance is a relative ulp, so it scales with magnitude and collapses to exact equality
+// at zero — which is right, since there is no relative error to allow for around zero.
+function isSameTick(a: number, b: number): boolean {
+	return Math.abs(a - b) <= Math.max(Math.abs(a), Math.abs(b)) * Number.EPSILON;
+}
+
 // The arithmetic tick grid `anchor + k * step`, clamped to [lower, upper] — the shared body of
 // splitsForStep and splitsForCategory (which differs only in clamping its bounds to the category
 // index range first). Every tick is computed from its own index rather than by adding `step` to
 // the previous one, so a fractional step accumulates no drift. Same candidate cap as walk().
 //
-// Each grid point has two faithful spellings, differing by at most an ulp: the *raw*
-// `anchor + k * step`, the exact continuation of the caller's own arithmetic, and the *rounded*
-// value actually emitted, which recovers the decimal the caller wrote (`3 * 0.1` becomes 0.3
-// again). A bound test therefore takes whichever of the two falls on the permissive side, because
-// a tick sitting exactly on `lower` or `upper` must not vanish merely because rounding carried it
-// across by one ulp — and it lands on either side depending on the case. With step 0.15 over
-// [0, 3 * 0.15] the top grid point is raw 0.44999999999999996 rounding *up* to the 0.45 the caller
-// wrote, so the rounded form fails the upper bound; with step 0.2 anchored at 1 over [-0.4, 0.4]
-// the bottom one is raw -0.40000000000000013 rounding *up* to -0.4, so the raw form fails the
-// lower bound. Either way the point is the bound, and it gets a tick.
+// Deciding whether a grid point is inside [lower, upper] is float comparison at its most
+// treacherous, because the point and the bound are two quantities that mean the same thing while
+// having reached the comparison by different arithmetic. Both sides of the test therefore get
+// tolerance, for two distinct reasons:
 //
-// So this grid owns its own bounds: what it returns is already ascending, unique and in range,
-// and callers must NOT run it back through normalize(), whose clamp re-tests the rounded values
-// against the raw scale bounds and would undo exactly that decision. An emitted tick can sit up
-// to one ulp outside [lower, upper] — the same point, spelled correctly.
+// On the tick's side, each grid point has two faithful spellings differing by at most an ulp: the
+// *raw* `anchor + k * step`, the exact continuation of the caller's own arithmetic, and the
+// *rounded* value actually emitted, which recovers the decimal the caller wrote (`3 * 0.1` becomes
+// 0.3 again). A bound test takes whichever of the two falls on the permissive side, since a tick
+// on the bound must not vanish because rounding carried it across — and it lands on either side
+// depending on the case. Step 0.15 over [0, 3 * 0.15]: the top point is raw 0.44999999999999996
+// rounding *up* to the 0.45 the caller wrote, so the rounded form fails the upper bound. Step 0.2
+// anchored at 1 over [-0.4, 0.4]: the bottom one is raw -0.40000000000000013 rounding *up* to
+// -0.4, so the raw form fails the lower bound.
+//
+// On the bound's side, the bound itself may carry the error instead. A range whose end was
+// computed some other way — `7 * 0.089 + 20 * 0.089` is 2.4029999999999996 where the grid's own
+// `27 * 0.089` is 2.403 — puts the last point an ulp above a bound that means to include it, and
+// no amount of respelling the tick fixes that. So the comparison asks isSameTick() whether the two
+// denote the same position at all before calling one past the other.
+//
+// This grid therefore owns its own bounds: what it returns is already ascending, unique and in
+// range, and callers must NOT run it back through normalize(), whose clamp re-tests the rounded
+// values against the raw scale bounds and would undo exactly these decisions. An emitted tick can
+// sit up to an ulp outside [lower, upper] — the same position, spelled correctly.
 function stepGrid(
 	anchor: number,
 	step: number,
@@ -274,7 +298,8 @@ function stepGrid(
 	const gridValue = (index: number): number => anchor + index * step;
 	const isAtOrAbove = (index: number): boolean => {
 		const raw = gridValue(index);
-		return Math.max(raw, roundTo(raw, digits)) >= lower;
+		const nearest = Math.max(raw, roundTo(raw, digits));
+		return nearest >= lower || isSameTick(nearest, lower);
 	};
 
 	// The quotient is float division and can land a hair either side of the true index —
@@ -294,7 +319,8 @@ function stepGrid(
 			break;
 		}
 		const value = roundTo(raw, digits);
-		if (Math.min(raw, value) > upper) {
+		const nearest = Math.min(raw, value);
+		if (nearest > upper && !isSameTick(nearest, upper)) {
 			break;
 		}
 		// An anchor that phases the grid across zero produces a raw value a hair below it, which
@@ -327,15 +353,6 @@ function normalize(values: number[], scaleMin: number, scaleMax: number): number
 // with the raw `0.44999999999999996` under splitsWithEdges — the decorators undoing the
 // generator's own correction. A tick set is the inner function's business; the decorator only
 // answers for what it adds.
-// Two doubles within an ulp of each other are one axis position spelled two ways — exactly what
-// stepGrid produces when it rounds a boundary tick to the decimal the caller wrote (`0.45`) while
-// the bound it came from stays `0.44999999999999996`. Set-based dedupe compares bits and misses
-// this, so an injected edge would otherwise be drawn as a second gridline a sub-pixel from the
-// first, with both labels stacked on it.
-function isSameTick(a: number, b: number): boolean {
-	return Math.abs(a - b) <= Math.max(Math.abs(a), Math.abs(b)) * Number.EPSILON;
-}
-
 function mergeTicks(ticks: number[], injected: number[], lower: number, upper: number): number[] {
 	const additions = injected.filter(
 		(value) => value >= lower && value <= upper && !ticks.some((tick) => isSameTick(tick, value))
