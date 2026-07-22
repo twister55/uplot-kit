@@ -1,0 +1,68 @@
+{
+	"name": "uplot-kit",
+	"version": "0.0.1",
+	"description": "Framework-agnostic, typed, tested plugins & utilities for uPlot",
+	"license": "MIT",
+	"repository": {
+		"type": "git",
+		"url": "git+https://github.com/twister55/uplot-kit.git"
+	},
+	"type": "module",
+	"sideEffects": false,
+	"files": [
+		"dist"
+	],
+	"types": "./dist/index.d.ts",
+	"exports": {
+		".": {
+			"types": "./dist/index.d.ts",
+			"import": "./dist/index.js"
+		},
+		"./package.json": "./package.json"
+	},
+	"scripts": {
+		"build": "tsup",
+		"test": "vitest run --passWithNoTests",
+		"test:watch": "vitest",
+		"check": "tsc --noEmit -p tsconfig.app.json && tsc --noEmit -p tsconfig.node.json",
+		"lint": "prettier --check . && eslint .",
+		"format": "prettier --write .",
+		"lint:pkg": "publint && attw --pack --profile esm-only"
+	},
+	"peerDependencies": {
+		"uplot": "^1.6"
+	},
+	"devDependencies": {
+		"@arethetypeswrong/cli": "^0.18.2",
+		"@eslint/js": "^10.0.1",
+		"@types/node": "^26.1.1",
+		"eslint": "^10.4.1",
+		"eslint-config-prettier": "^10.1.8",
+		"eslint-import-resolver-typescript": "^4.4.5",
+		"eslint-plugin-import-x": "^4.17.1",
+		"eslint-plugin-perfectionist": "^5.10.0",
+		"eslint-plugin-unused-imports": "^4.4.1",
+		"globals": "^17.6.0",
+		"prettier": "^3.8.3",
+		"publint": "^0.3.21",
+		"tsup": "^8.5.0",
+		"typescript": "^6.0.3",
+		"typescript-eslint": "^8.60.1",
+		"uplot": "^1.6.32",
+		"vitest": "^4.1.10"
+	},
+	"keywords": [
+		"uplot",
+		"plugin",
+		"plugins",
+		"chart",
+		"charts",
+		"plot",
+		"timeseries",
+		"annotations",
+		"zoom",
+		"stacked",
+		"canvas",
+		"typescript"
+	]
+}

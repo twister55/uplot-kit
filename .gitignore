@@ -1,0 +1,9 @@
+node_modules
+dist
+demos/dist
+*.tsbuildinfo
+.DS_Store
+
+.vscode
+.idea
+*.iml
