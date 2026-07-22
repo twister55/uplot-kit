@@ -367,12 +367,21 @@ export interface SplitsForTimeOptions {
  * import uPlot from 'uplot';
  * import { splitsForTime } from 'uplot-kit';
  *
+ * const DAY = 24 * 60 * 60;
+ * const start = Date.UTC(2026, 0, 1) / 1000; // axis values are Unix seconds
+ * const data: uPlot.AlignedData = [
+ *   [start, start + DAY, start + 2 * DAY, start + 3 * DAY],
+ *   [12, 18, 9, 21]
+ * ];
+ *
  * const opts: uPlot.Options = {
  *   width: 800,
  *   height: 400,
  *   series: [{}, { label: 'value' }],
  *   axes: [{ splits: splitsForTime({ granularity: 'day' }) }, {}]
  * };
+ *
+ * new uPlot(opts, data, document.body);
  * ```
  */
 export function splitsForTime(options: SplitsForTimeOptions = {}): SplitsFn {
@@ -445,6 +454,12 @@ export interface SplitsForLogOptions {
  * import uPlot from 'uplot';
  * import { splitsForLog } from 'uplot-kit';
  *
+ * const start = Date.UTC(2026, 0, 1) / 1000;
+ * const data: uPlot.AlignedData = [
+ *   [start, start + 60, start + 120, start + 180, start + 240],
+ *   [1.5, 12, 130, 900, 4200] // strictly positive — a log scale has no place for 0
+ * ];
+ *
  * const opts: uPlot.Options = {
  *   width: 800,
  *   height: 400,
@@ -452,6 +467,8 @@ export interface SplitsForLogOptions {
  *   scales: { y: { distr: 3, log: 10 } },
  *   axes: [{}, { splits: splitsForLog({ base: 10, minor: true }) }]
  * };
+ *
+ * new uPlot(opts, data, document.body);
  * ```
  */
 export function splitsForLog(options: SplitsForLogOptions = {}): SplitsFn {
@@ -502,8 +519,11 @@ export interface SplitsForStepOptions {
 	step: number;
 	/**
 	 * Axis value the tick grid is phased against — ticks land at `anchor + k * step`
-	 * for integer `k`, so a step that doesn't divide evenly into round axis values
-	 * (e.g. a 15-minute candle series starting mid-hour) still ticks on-bucket.
+	 * for integer `k`, so buckets whose origin isn't a round axis value (e.g. hourly
+	 * candles from a session opening at 09:30) still tick on-bucket. Only an anchor
+	 * that is *not* a whole multiple of `step` shifts the grid: quarter-hour wall-clock
+	 * times are already on a 900s grid, so anchoring 15-minute candles to 09:30 is a
+	 * no-op.
 	 * @default 0
 	 */
 	anchor?: number;
@@ -525,13 +545,23 @@ export interface SplitsForStepOptions {
  * import uPlot from 'uplot';
  * import { splitsForStep } from 'uplot-kit';
  *
+ * const HOUR = 60 * 60;
+ * // a session opening at 09:30 — half an hour off the round wall-clock grid
+ * const open = Date.UTC(2026, 0, 2, 9, 30) / 1000;
+ * const data: uPlot.AlignedData = [
+ *   [open, open + HOUR, open + 2 * HOUR, open + 3 * HOUR],
+ *   [101.2, 103.8, 102.4, 105.1]
+ * ];
+ *
  * const opts: uPlot.Options = {
  *   width: 800,
  *   height: 400,
  *   series: [{}, { label: 'close' }],
- *   // ticks every 15-minute candle (900s), phased to a 09:30 session open
- *   axes: [{ splits: splitsForStep({ step: 900, anchor: 9.5 * 3600 }) }, {}]
+ *   // hourly ticks landing on 09:30, 10:30, 11:30 … instead of on round hours
+ *   axes: [{ splits: splitsForStep({ step: HOUR, anchor: open }) }, {}]
  * };
+ *
+ * new uPlot(opts, data, document.body);
  * ```
  */
 export function splitsForStep(options: SplitsForStepOptions): SplitsFn {
@@ -587,19 +617,29 @@ export interface SplitsForCategoryOptions {
  * import { splitsForCategory } from 'uplot-kit';
  *
  * const categories = ['mon', 'tue', 'wed', 'thu', 'fri'];
+ * // an ordinal x holds the category values themselves; uPlot's AlignedData is typed
+ * // numerically, so the cast is unavoidable here
+ * const data = [categories, [12, 18, 9, 21, 15]] as unknown as uPlot.AlignedData;
+ *
  * const opts: uPlot.Options = {
  *   width: 800,
  *   height: 400,
  *   series: [{}, { label: 'value' }],
- *   scales: { x: { distr: 2 } },
+ *   // time: false — an ordinal x is not timestamps, and uPlot's default would format
+ *   // the legend value as a 1970 date
+ *   scales: { x: { distr: 2, time: false } },
  *   axes: [
  *     {
  *       splits: splitsForCategory({ count: categories.length }),
- *       values: (_u, ticks) => ticks.map((i) => categories[i] ?? '')
+ *       // uPlot maps ordinal splits through data[0] before calling `values`, so `ticks`
+ *       // already holds the category values — indexing `categories` again would blank them
+ *       values: (_u, ticks) => ticks.map(String)
  *     },
  *     {}
  *   ]
  * };
+ *
+ * new uPlot(opts, data, document.body);
  * ```
  */
 export function splitsForCategory(options: SplitsForCategoryOptions = {}): SplitsFn {
@@ -652,9 +692,14 @@ export function splitsForCategory(options: SplitsForCategoryOptions = {}): Split
  * @example
  * ```ts
  * import uPlot from 'uplot';
- * import { splitsWithInclude, splitsForStep } from 'uplot-kit';
+ * import { splitsForStep, splitsWithInclude } from 'uplot-kit';
  *
  * const ERROR_BUDGET = 99.9;
+ * const start = Date.UTC(2026, 0, 1) / 1000;
+ * const data: uPlot.AlignedData = [
+ *   [start, start + 3600, start + 7200, start + 10800],
+ *   [99.98, 99.72, 99.94, 100]
+ * ];
  *
  * const opts: uPlot.Options = {
  *   width: 800,
@@ -663,6 +708,8 @@ export function splitsForCategory(options: SplitsForCategoryOptions = {}): Split
  *   scales: { y: { range: [99, 100] } },
  *   axes: [{}, { splits: splitsWithInclude(splitsForStep({ step: 0.25 }), [ERROR_BUDGET]) }]
  * };
+ *
+ * new uPlot(opts, data, document.body);
  * ```
  */
 export function splitsWithInclude(inner: SplitsFn, values: number[]): SplitsFn {
@@ -691,7 +738,14 @@ export function splitsWithInclude(inner: SplitsFn, values: number[]): SplitsFn {
  * @example
  * ```ts
  * import uPlot from 'uplot';
- * import { splitsWithLimit, splitsForTime } from 'uplot-kit';
+ * import { splitsForTime, splitsWithLimit } from 'uplot-kit';
+ *
+ * // two decades of yearly samples: the ladder has already widened to year ticks, and the
+ * // limit thins those 21 down to every other one
+ * const data: uPlot.AlignedData = [
+ *   Array.from({ length: 21 }, (_, i) => Date.UTC(2006 + i, 0, 1) / 1000),
+ *   Array.from({ length: 21 }, (_, i) => 100 + ((i * 7) % 23))
+ * ];
  *
  * const opts: uPlot.Options = {
  *   width: 800,
@@ -699,6 +753,8 @@ export function splitsWithInclude(inner: SplitsFn, values: number[]): SplitsFn {
  *   series: [{}, { label: 'value' }],
  *   axes: [{ splits: splitsWithLimit(splitsForTime({ granularity: 'day' }), 12) }, {}]
  * };
+ *
+ * new uPlot(opts, data, document.body);
  * ```
  */
 export function splitsWithLimit(inner: SplitsFn, max: number): SplitsFn {
@@ -733,12 +789,19 @@ export function splitsWithLimit(inner: SplitsFn, max: number): SplitsFn {
  * @example
  * ```ts
  * import uPlot from 'uplot';
- * import { splitsWithFilter, splitsForTime } from 'uplot-kit';
+ * import { splitsForTime, splitsWithFilter } from 'uplot-kit';
  *
  * const isWeekday = (value: number) => {
  *   const day = new Date(value * 1000).getUTCDay();
  *   return day !== 0 && day !== 6;
  * };
+ *
+ * const DAY = 24 * 60 * 60;
+ * const start = Date.UTC(2026, 0, 5) / 1000; // a Monday
+ * const data: uPlot.AlignedData = [
+ *   Array.from({ length: 8 }, (_, i) => start + i * DAY),
+ *   Array.from({ length: 8 }, (_, i) => 10 + ((i * 3) % 7))
+ * ];
  *
  * const opts: uPlot.Options = {
  *   width: 800,
@@ -746,6 +809,8 @@ export function splitsWithLimit(inner: SplitsFn, max: number): SplitsFn {
  *   series: [{}, { label: 'value' }],
  *   axes: [{ splits: splitsWithFilter(splitsForTime({ granularity: 'day' }), isWeekday) }, {}]
  * };
+ *
+ * new uPlot(opts, data, document.body);
  * ```
  */
 export function splitsWithFilter(
@@ -787,7 +852,14 @@ export interface SplitsWithEdgesOptions {
  * @example
  * ```ts
  * import uPlot from 'uplot';
- * import { splitsWithEdges, splitsForTime } from 'uplot-kit';
+ * import { splitsForTime, splitsWithEdges } from 'uplot-kit';
+ *
+ * const HOUR = 60 * 60;
+ * const start = Date.UTC(2026, 0, 5, 6, 0) / 1000; // 06:00, mid-day
+ * const data: uPlot.AlignedData = [
+ *   [start, start + HOUR, start + 2 * HOUR, start + 3 * HOUR],
+ *   [12, 18, 9, 21]
+ * ];
  *
  * const opts: uPlot.Options = {
  *   width: 800,
@@ -796,6 +868,8 @@ export interface SplitsWithEdgesOptions {
  *   // an intraday zoom contains no midnight; show the range edges instead of a blank axis
  *   axes: [{ splits: splitsWithEdges(splitsForTime({ granularity: 'day' })) }, {}]
  * };
+ *
+ * new uPlot(opts, data, document.body);
  * ```
  */
 export function splitsWithEdges(inner: SplitsFn, options: SplitsWithEdgesOptions = {}): SplitsFn {
