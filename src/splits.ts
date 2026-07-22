@@ -12,9 +12,10 @@ const SECONDS_PER_DAY = 60 * 60 * 24;
 const SECONDS_PER_WEEK = 7 * SECONDS_PER_DAY;
 const APPROXIMATE_YEAR = 366 * SECONDS_PER_DAY;
 
-// Shared cap for every generator's tick walk — bites only on absurd ranges (e.g. millisecond
-// or nanosecond epoch values fed to a seconds axis), turning unbounded per-redraw work into a
-// bounded walk with one loud warning per generator instance.
+// Shared cap for every generator's tick walk — bites only on absurd ranges (one spanning
+// millions of years, say), turning unbounded per-redraw work into a bounded walk with one loud
+// warning per generator instance. It is not a unit-mismatch guard: a timestamp axis in a finer
+// unit than seconds is a supported configuration, declared through splitsForTime's `ms`.
 const MAX_TICK_CANDIDATES = 10_000;
 
 /** The `axis.splits` function shape every generator below returns, and every decorator wraps
@@ -330,10 +331,18 @@ export interface SplitsForTimeOptions {
 	 */
 	granularity?: SplitsForTimeGranularity;
 	/**
+	 * Unit the axis's own timestamps are in, with the same meaning and the same two values
+	 * as uPlot's top-level `ms` option: `1e-3` for Unix seconds, `1` for milliseconds.
+	 * Pass whatever was passed to uPlot — a millisecond axis left at the seconds default
+	 * reads every timestamp as ~1000x further from the epoch than it is, putting the ticks
+	 * tens of thousands of years out.
+	 * @default 1e-3 — Unix seconds, matching uPlot's own default
+	 */
+	ms?: 1e-3 | 1;
+	/**
 	 * Fixed UTC offset, in seconds, used only to place calendar boundaries (day/week/
-	 * month/year starts) — axis values themselves stay in whatever unit the caller
-	 * already uses (Unix seconds). Match this to the `offsetSec` passed to
-	 * `timeRegions` so both agree on where a day starts.
+	 * month/year starts) — axis values themselves stay in the unit `ms` declares. Match
+	 * this to the `offsetSec` passed to `timeRegions` so both agree on where a day starts.
 	 * @default 0
 	 */
 	offsetSec?: number;
@@ -349,6 +358,9 @@ export interface SplitsForTimeOptions {
  * Builds a uPlot `axis.splits` function that ticks a time axis on round calendar
  * boundaries (day/week/month/quarter/year starts) instead of uPlot's evenly-spaced
  * default, widening to a coarser step as the visible range grows.
+ *
+ * Axis values are read as Unix seconds by default; a millisecond axis must say so with
+ * `ms: 1`, the same value uPlot itself takes, or every boundary lands millennia away.
  *
  * Ticks are exactly the calendar boundaries that fall inside the visible range, with no
  * exceptions — like uPlot's own default splits, no range-edge ticks are injected, so every
@@ -385,29 +397,41 @@ export interface SplitsForTimeOptions {
  * ```
  */
 export function splitsForTime(options: SplitsForTimeOptions = {}): SplitsFn {
-	const { granularity = 'day', offsetSec = 0, weekStartsOn = 0 } = options;
+	const { granularity = 'day', ms = 1e-3, offsetSec = 0, weekStartsOn = 0 } = options;
 	const startIdx = SPLIT_LEVELS.findIndex((level) => level.granularity === granularity);
 	const levels = SPLIT_LEVELS.slice(startIdx < 0 ? 0 : startIdx);
 	const ctx: SplitContext = { offsetSec, weekStartsOn };
 	const warn = makeWarnOnce('splitsForTime');
+	// Axis units per second, derived the same way uPlot derives its own: it reads a timestamp
+	// as `new Date(value / ms)` milliseconds, so a second is `1000 * ms` axis units — exactly
+	// 1 for the seconds default (`1000 * 1e-3` is exact) and 1000 for a millisecond axis.
+	// Every calendar boundary below is computed in seconds, the one unit the helpers and the
+	// widening ladder are written in; the axis's own unit enters only here and on the way out.
+	const unitsPerSec = 1000 * ms;
 
 	return (_self, _axisIdx, scaleMin, scaleMax) => {
 		if (!isTickable(scaleMin, scaleMax)) {
 			return [];
 		}
 
-		const range = scaleMax - scaleMin;
+		const minSec = scaleMin / unitsPerSec;
+		const maxSec = scaleMax / unitsPerSec;
+		const range = maxSec - minSec;
 		// isTickable has already rejected non-finite bounds, so `range` is finite and the
 		// Infinity-limited coarsest level always matches; the fallback is only for the type.
 		const level = levels.find((candidate) => range <= candidate.rangeLimit) ?? YEAR_LEVEL;
 
+		const ticks = walk(
+			level.getInitialValue(minSec, ctx),
+			maxSec,
+			(currentValue) => level.getNextValue(currentValue, ctx),
+			makeCollector(warn)
+		);
+
 		return normalize(
-			walk(
-				level.getInitialValue(scaleMin, ctx),
-				scaleMax,
-				(currentValue) => level.getNextValue(currentValue, ctx),
-				makeCollector(warn)
-			),
+			// Scaling back is a no-op on a seconds axis, so the default path keeps the walk's
+			// own array instead of paying for a copy of it every redraw.
+			unitsPerSec === 1 ? ticks : ticks.map((value) => value * unitsPerSec),
 			scaleMin,
 			scaleMax
 		);

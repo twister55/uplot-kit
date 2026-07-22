@@ -246,15 +246,68 @@ describe('splitsForTime', () => {
 		});
 	});
 
-	it('defaults to day granularity and zero offset', () => {
+	it('defaults to day granularity, seconds, and zero offset', () => {
 		const withDefaults = splitsForTime();
-		const explicit = splitsForTime({ granularity: 'day', offsetSec: 0, weekStartsOn: 0 });
+		const explicit = splitsForTime({
+			granularity: 'day',
+			ms: 1e-3,
+			offsetSec: 0,
+			weekStartsOn: 0
+		});
 		const scaleMin = unixSec('2026-01-01T00:00:00Z');
 		const scaleMax = unixSec('2026-01-05T00:00:00Z');
 
 		expect(withDefaults(fakeSelf(), 0, scaleMin, scaleMax, 0, 0)).toEqual(
 			explicit(fakeSelf(), 0, scaleMin, scaleMax, 0, 0)
 		);
+	});
+
+	it('ticks midnight boundaries on a millisecond axis when ms is 1', () => {
+		const splits = splitsForTime({ granularity: 'day', ms: 1 });
+		const scaleMin = Date.parse('2026-01-01T06:00:00Z');
+		const scaleMax = Date.parse('2026-01-05T18:00:00Z');
+
+		const result = splits(fakeSelf(), 0, scaleMin, scaleMax, 0, 0);
+
+		// left at the seconds default these bounds read as ~50,000 years from the epoch and
+		// the ladder widens all the way to yearly ticks; ms: 1 keeps them four days apart
+		expect(result).toEqual([
+			Date.parse('2026-01-02T00:00:00Z'),
+			Date.parse('2026-01-03T00:00:00Z'),
+			Date.parse('2026-01-04T00:00:00Z'),
+			Date.parse('2026-01-05T00:00:00Z')
+		]);
+	});
+
+	it('picks the same instants on a millisecond axis as on a seconds one', () => {
+		const iso = ['2025-11-20T13:37:00Z', '2027-02-04T09:15:00Z'] as const;
+
+		for (const granularity of ['day', 'week', 'month', 'quarter', 'year'] as const) {
+			const inSeconds = splitsForTime({ granularity });
+			const inMillis = splitsForTime({ granularity, ms: 1 });
+
+			const seconds = inSeconds(fakeSelf(), 0, unixSec(iso[0]), unixSec(iso[1]), 0, 0);
+			const millis = inMillis(fakeSelf(), 0, Date.parse(iso[0]), Date.parse(iso[1]), 0, 0);
+
+			// the unit changes the numbers, never which moments in time get a tick
+			expect(millis.length).toBeGreaterThan(0);
+			expect(millis).toEqual(seconds.map((value) => value * 1000));
+		}
+	});
+
+	it('keeps offsetSec in seconds on a millisecond axis', () => {
+		const offsetSec = 3 * 3600; // UTC+3
+		const splits = splitsForTime({ granularity: 'day', ms: 1, offsetSec });
+		const scaleMin = Date.parse('2026-01-01T00:30:00Z');
+		const scaleMax = Date.parse('2026-01-04T00:30:00Z');
+
+		const result = splits(fakeSelf(), 0, scaleMin, scaleMax, 0, 0);
+
+		// offsetSec stays in seconds while the axis values are milliseconds
+		expect(result.length).toBe(3);
+		for (const value of result) {
+			expect((value + offsetSec * 1000) % 86_400_000).toBe(0);
+		}
 	});
 });
 
