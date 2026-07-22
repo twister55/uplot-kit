@@ -264,6 +264,34 @@ function normalize(values: number[], scaleMin: number, scaleMax: number): number
 	return [...new Set(values)].filter((v) => v >= scaleMin && v <= scaleMax).sort((a, b) => a - b);
 }
 
+// How every injecting decorator folds its own values into an inner function's ticks: the
+// injected ones are clamped to [lower, upper], the inner's are taken as given, and the union is
+// deduped and sorted.
+//
+// Only the injected side is clamped, and that asymmetry is the point. The inner function has
+// already decided which of its ticks belong, with more information than this has — stepGrid in
+// particular emits a boundary tick whose rounded form (`0.45`) sits an ulp outside the raw
+// bound it was derived from, deliberately, because that is the value the caller wrote. Running
+// that back through normalize()'s clamp deleted the tick under splitsWithInclude and replaced it
+// with the raw `0.44999999999999996` under splitsWithEdges — the decorators undoing the
+// generator's own correction. A tick set is the inner function's business; the decorator only
+// answers for what it adds.
+// Two doubles within an ulp of each other are one axis position spelled two ways — exactly what
+// stepGrid produces when it rounds a boundary tick to the decimal the caller wrote (`0.45`) while
+// the bound it came from stays `0.44999999999999996`. Set-based dedupe compares bits and misses
+// this, so an injected edge would otherwise be drawn as a second gridline a sub-pixel from the
+// first, with both labels stacked on it.
+function isSameTick(a: number, b: number): boolean {
+	return Math.abs(a - b) <= Math.max(Math.abs(a), Math.abs(b)) * Number.EPSILON;
+}
+
+function mergeTicks(ticks: number[], injected: number[], lower: number, upper: number): number[] {
+	const additions = injected.filter(
+		(value) => value >= lower && value <= upper && !ticks.some((tick) => isSameTick(tick, value))
+	);
+	return [...new Set([...ticks, ...additions])].sort((a, b) => a - b);
+}
+
 // --- splitsForTime ---
 
 // Fixed-offset calendar math: axis values are plain Unix seconds, and Date's UTC
@@ -346,6 +374,9 @@ const YEAR_LEVEL: SplitLevel = {
 // first entry — falling back to it means keeping every rung, which is what `slice(0)` below
 // expresses — so moving it here would need that slice to look the index up instead.
 const DEFAULT_GRANULARITY: SplitsForTimeGranularity = 'day';
+
+// Unix seconds, matching uPlot's own default for the option this mirrors.
+const DEFAULT_MS = 1e-3;
 
 const SPLIT_LEVELS: SplitLevel[] = [
 	{
@@ -457,7 +488,12 @@ export interface SplitsForTimeOptions {
  * ```
  */
 export function splitsForTime(options: SplitsForTimeOptions = {}): SplitsFn {
-	const { granularity = DEFAULT_GRANULARITY, ms = 1e-3, offsetSec = 0, weekStartsOn = 0 } = options;
+	const {
+		granularity = DEFAULT_GRANULARITY,
+		ms = DEFAULT_MS,
+		offsetSec = 0,
+		weekStartsOn = 0
+	} = options;
 	const ctx: SplitContext = { offsetSec, weekStartsOn };
 	const warn = makeWarnOnce('splitsForTime');
 
@@ -481,7 +517,18 @@ export function splitsForTime(options: SplitsForTimeOptions = {}): SplitsFn {
 	// 1 for the seconds default (`1000 * 1e-3` is exact) and 1000 for a millisecond axis.
 	// Every calendar boundary below is computed in seconds, the one unit the helpers and the
 	// widening ladder are written in; the axis's own unit enters only here and on the way out.
-	const unitsPerSec = 1000 * ms;
+	//
+	// Every bound is divided by this, so a zero or non-finite one would turn the whole range
+	// into NaN and every tick into nonsense. What is checked is the arithmetic, not uPlot's
+	// two-value enum: any finite positive unit keeps the math well-defined, so a caller ahead
+	// of uPlot on units is not blocked for the sake of it.
+	let unitsPerSec = 1000 * ms;
+	if (!Number.isFinite(unitsPerSec) || unitsPerSec <= 0) {
+		warn(
+			`ms must be finite and positive, got ${JSON.stringify(ms)} — falling back to ${DEFAULT_MS}`
+		);
+		unitsPerSec = 1000 * DEFAULT_MS;
+	}
 
 	return (_self, _axisIdx, scaleMin, scaleMax) => {
 		if (!isTickable(scaleMin, scaleMax)) {
@@ -491,8 +538,12 @@ export function splitsForTime(options: SplitsForTimeOptions = {}): SplitsFn {
 		const minSec = scaleMin / unitsPerSec;
 		const maxSec = scaleMax / unitsPerSec;
 		const range = maxSec - minSec;
-		// isTickable has already rejected non-finite bounds, so `range` is finite and the
-		// Infinity-limited coarsest level always matches; the fallback is only for the type.
+		// The coarsest rung's rangeLimit is Infinity, so for any finite `range` the lookup
+		// matches and the fallback is dead weight the compiler nonetheless needs. `range` is
+		// finite for every unit a caller can realistically pass — isTickable has rejected
+		// non-finite bounds and the `ms` guard above has rejected a zero or non-finite scale —
+		// but a denormal-small unit can still overflow the division, so the fallback stays a
+		// real backstop rather than a formality.
 		const level = levels.find((candidate) => range <= candidate.rangeLimit) ?? YEAR_LEVEL;
 
 		const ticks = walk(
@@ -816,8 +867,9 @@ export function splitsForCategory(options: SplitsForCategoryOptions = {}): Split
 export function splitsWithInclude(inner: SplitsFn, values: number[]): SplitsFn {
 	return inheritDomain((self, axisIdx, scaleMin, scaleMax, foundIncr, foundSpace) => {
 		const [lower, upper] = domainOf(inner, scaleMin, scaleMax);
-		return normalize(
-			[...inner(self, axisIdx, scaleMin, scaleMax, foundIncr, foundSpace), ...values],
+		return mergeTicks(
+			inner(self, axisIdx, scaleMin, scaleMax, foundIncr, foundSpace),
+			values,
 			lower,
 			upper
 		);
@@ -834,8 +886,10 @@ export function splitsWithInclude(inner: SplitsFn, values: number[]): SplitsFn {
  * k-th tick for the smallest k that fits under the limit, so a tick set only slightly over
  * `max` can thin well below it (11 ticks with `max: 10` gives 6, at k = 2). A fractional `max`
  * is floored, so a measured `plotWidth / labelWidth` needs no rounding at the call site.
- * `NaN` (from a not-yet-measured label width) and `Infinity` both mean no limit and pass the
- * inner ticks through; a `max` below one — `-Infinity` and zero included — yields no ticks.
+ * A `max` that isn't a usable number — `NaN` from a not-yet-measured label width, or the
+ * `undefined` / `null` a JS caller passes for the same reason — means the limit is unknown, not
+ * that nothing fits, and passes the inner ticks through, as does an explicit `Infinity`. A `max`
+ * below one — `-Infinity` and zero included — yields no ticks.
  *
  * @example
  * ```ts
@@ -862,11 +916,14 @@ export function splitsWithInclude(inner: SplitsFn, values: number[]): SplitsFn {
 export function splitsWithLimit(inner: SplitsFn, max: number): SplitsFn {
 	return inheritDomain((self, axisIdx, scaleMin, scaleMax, foundIncr, foundSpace) => {
 		const ticks = inner(self, axisIdx, scaleMin, scaleMax, foundIncr, foundSpace);
-		// A max derived from a measurement can be NaN before first layout (a zero label width
-		// divides into one) or Infinity; neither means "show nothing", so the ticks pass
-		// through unthinned rather than blanking the axis. -Infinity is not in that company:
-		// it orders below every real limit, so it falls through to the max <= 0 case.
-		if (Number.isNaN(max) || max === Infinity) {
+		// "Not measured yet" is not "show nothing", so an unusable `max` passes the ticks
+		// through unthinned rather than blanking the axis. It arrives spelled three ways: `NaN`
+		// from a division that had a zero label width, and — since the caller doing the
+		// measuring is often plain JS — `undefined` or `null` from a width that was never
+		// assigned. `Infinity` is an explicit no-limit and lands in the same place. `-Infinity`
+		// is deliberately not in this company: it orders below every real limit, so it falls
+		// through to the "nothing fits" case below.
+		if (typeof max !== 'number' || Number.isNaN(max) || max === Infinity) {
 			return ticks;
 		}
 		// Floored, because a measurement-derived max is the fractional `plotWidth / labelWidth`
@@ -983,9 +1040,12 @@ export function splitsWithEdges(inner: SplitsFn, options: SplitsWithEdgesOptions
 	return inheritDomain((self, axisIdx, scaleMin, scaleMax, foundIncr, foundSpace) => {
 		const ticks = inner(self, axisIdx, scaleMin, scaleMax, foundIncr, foundSpace);
 		const [lower, upper] = domainOf(inner, scaleMin, scaleMax);
-		if (mode === 'always') {
-			return normalize([...ticks, lower, upper], lower, upper);
+		// Both modes go through the same merge, so the two differ only in *when* the edges are
+		// added, never in what the decorator guarantees about the result. The empty-inner case is
+		// the same call with nothing to merge into.
+		if (mode === 'always' || ticks.length === 0) {
+			return mergeTicks(ticks, [lower, upper], lower, upper);
 		}
-		return ticks.length > 0 ? ticks : normalize([lower, upper], lower, upper);
+		return ticks;
 	}, inner);
 }
