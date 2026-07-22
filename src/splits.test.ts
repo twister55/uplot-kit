@@ -115,6 +115,41 @@ describe('splitsForTime', () => {
 		}
 	});
 
+	it('warns once and falls back to seconds for a degenerate ms', () => {
+		const warn = vi.spyOn(console, 'warn').mockImplementation(() => {});
+		try {
+			const scaleMin = unixSec('2026-01-01T00:00:00Z');
+			const scaleMax = unixSec('2026-01-06T00:00:00Z');
+			const seconds = splitsForTime({ granularity: 'day' })(
+				fakeSelf(),
+				0,
+				scaleMin,
+				scaleMax,
+				0,
+				0
+			);
+
+			// every bound is divided by 1000 * ms, so a zero or non-finite unit turns the range
+			// into NaN and pushes the ladder lookup past its last rung
+			for (const ms of [0, -1, NaN, Infinity]) {
+				expect(
+					splitsForTime({ granularity: 'day', ms: ms as 1e-3 })(
+						fakeSelf(),
+						0,
+						scaleMin,
+						scaleMax,
+						0,
+						0
+					)
+				).toEqual(seconds);
+			}
+			expect(warn).toHaveBeenCalledTimes(4); // one per factory, not per redraw
+			expect(warn.mock.calls[0]?.[0]).toContain('ms must be finite and positive');
+		} finally {
+			warn.mockRestore();
+		}
+	});
+
 	it('ticks quarter starts, not arbitrary three-month offsets', () => {
 		const splits = splitsForTime({ granularity: 'quarter' });
 		// starts mid-quarter, so a rung that stepped from scaleMin instead of the year start
@@ -751,6 +786,19 @@ describe('splitsWithLimit', () => {
 		).toEqual(base);
 	});
 
+	it('treats an unmeasured max as no limit rather than blanking the axis', () => {
+		const base = [0, 10, 20, 30];
+		const inner = splitsForStep({ step: 10 });
+
+		// a JS caller spells "the label width is not measured yet" as undefined or null just as
+		// readily as NaN, and none of the three means "nothing fits"
+		for (const max of [undefined, null]) {
+			expect(splitsWithLimit(inner, max as unknown as number)(fakeSelf(), 0, 0, 30, 0, 0)).toEqual(
+				base
+			);
+		}
+	});
+
 	it('treats -Infinity as a non-positive max, not as no limit', () => {
 		// -Infinity orders below every real limit, so it means "nothing fits", the same as 0
 		expect(
@@ -949,6 +997,23 @@ describe('splitsWithEdges', () => {
 		const wrapped = splitsWithEdges(splitsForCategory({ count: 5, step: 3 }));
 
 		expect(wrapped(fakeSelf(), 0, 1, 2, 0, 0)).toEqual([1, 2]);
+	});
+
+	it('does not re-clamp the inner ticks, nor double the edge it already covers', () => {
+		// stepGrid emits the boundary tick as 0.45 — the value the caller wrote — while the raw
+		// bound it came from stays 0.44999999999999996. Re-clamping the inner's output against
+		// that bound deleted the tick; injecting the bound beside it drew a second gridline a
+		// sub-pixel away with both labels stacked. Neither may happen.
+		const inner = splitsForStep({ step: 0.15 });
+		const scaleMax = 3 * 0.15;
+
+		expect(inner(fakeSelf(), 0, 0, scaleMax, 0, 0)).toEqual([0, 0.15, 0.3, 0.45]);
+		expect(splitsWithEdges(inner, { mode: 'always' })(fakeSelf(), 0, 0, scaleMax, 0, 0)).toEqual([
+			0, 0.15, 0.3, 0.45
+		]);
+		expect(splitsWithInclude(inner, [])(fakeSelf(), 0, 0, scaleMax, 0, 0)).toEqual([
+			0, 0.15, 0.3, 0.45
+		]);
 	});
 
 	it('carries the inner domain through a chain of decorators', () => {
