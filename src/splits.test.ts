@@ -60,9 +60,51 @@ describe('splitsForTime', () => {
 		const result = splits(fakeSelf(), 0, scaleMin, scaleMax, 0, 0);
 
 		// week starts are Sundays (day-of-week 0)
+		expect(result.length).toBe(2);
 		for (const value of result) {
 			expect(new Date(value * 1000).getUTCDay()).toBe(0);
 		}
+	});
+
+	it('honours the granularity floor on a range the finer levels would still cover', () => {
+		// 5 days is inside the day level's own ~10-day limit, so the ladder would tick daily
+		// unless the requested floor actually removes the finer levels — the one range shape
+		// that tells the two apart
+		const scaleMin = unixSec('2026-01-01T00:00:00Z');
+		const scaleMax = unixSec('2026-01-06T00:00:00Z');
+
+		expect(splitsForTime({ granularity: 'day' })(fakeSelf(), 0, scaleMin, scaleMax, 0, 0)).toEqual([
+			unixSec('2026-01-01T00:00:00Z'),
+			unixSec('2026-01-02T00:00:00Z'),
+			unixSec('2026-01-03T00:00:00Z'),
+			unixSec('2026-01-04T00:00:00Z'),
+			unixSec('2026-01-05T00:00:00Z'),
+			unixSec('2026-01-06T00:00:00Z')
+		]);
+		// a week floor keeps only the Sunday, a month floor nothing at all
+		expect(splitsForTime({ granularity: 'week' })(fakeSelf(), 0, scaleMin, scaleMax, 0, 0)).toEqual(
+			[unixSec('2026-01-04T00:00:00Z')]
+		);
+		expect(
+			splitsForTime({ granularity: 'month' })(fakeSelf(), 0, scaleMin, scaleMax, 0, 0)
+		).toEqual([unixSec('2026-01-01T00:00:00Z')]);
+	});
+
+	it('ticks quarter starts, not arbitrary three-month offsets', () => {
+		const splits = splitsForTime({ granularity: 'quarter' });
+		// starts mid-quarter, so a rung that stepped from scaleMin instead of the year start
+		// would tick Feb/May/Aug/Nov
+		const scaleMin = unixSec('2026-02-14T00:00:00Z');
+		const scaleMax = unixSec('2027-03-01T00:00:00Z');
+
+		const result = splits(fakeSelf(), 0, scaleMin, scaleMax, 0, 0);
+
+		expect(result).toEqual([
+			unixSec('2026-04-01T00:00:00Z'),
+			unixSec('2026-07-01T00:00:00Z'),
+			unixSec('2026-10-01T00:00:00Z'),
+			unixSec('2027-01-01T00:00:00Z')
+		]);
 	});
 
 	it('starts weeks on the configured day when weekStartsOn is set', () => {
@@ -141,6 +183,10 @@ describe('splitsForTime', () => {
 
 		const result = splits(fakeSelf(), 0, scaleMin, scaleMax, 0, 0);
 
+		// asserted before the walk: reduce without a seed never invokes its callback on a
+		// one-element array and throws on an empty one, so the ordering check below is only
+		// meaningful once there is a run of ticks to check
+		expect(result.length).toBeGreaterThan(2);
 		result.reduce((previous, current) => {
 			expect(current).toBeGreaterThan(previous);
 			return current;
@@ -240,6 +286,9 @@ describe('splitsForTime', () => {
 
 		const result = splits(fakeSelf(), 0, scaleMin, scaleMax, 0, 0);
 
+		// pinned exactly: a ladder regression that widened this range to one weekly tick would
+		// leave the spacing assertion below running zero times
+		expect(result.length).toBe(5);
 		result.reduce((previous, current) => {
 			expect(current - previous).toBe(86400);
 			return current;
@@ -377,10 +426,25 @@ describe('splitsForLog', () => {
 
 		const result = splits(fakeSelf(), 0, 1, 1000, 0, 0);
 
+		expect(result.length).toBeGreaterThan(2);
 		result.reduce((previous, current) => {
 			expect(current).toBeGreaterThan(previous);
 			return current;
 		});
+	});
+
+	it('places fractional minor mantissas exactly, not on the decade grid', () => {
+		// base 2 has no integer mantissa to offer — none exists between 1 and 2 — so a
+		// fractional one is the only way to get a minor tick at all
+		expect(
+			splitsForLog({ base: 2, minor: true, minorMantissas: [1.5] })(fakeSelf(), 0, 0.25, 1, 0, 0)
+		).toEqual([0.25, 0.375, 0.5, 0.75, 1]);
+
+		// rounding to the decade's own precision would snap 0.0015 onto 0.002, where it
+		// collides with the real 2-mantissa tick and is deduped away entirely
+		expect(
+			splitsForLog({ minor: true, minorMantissas: [1.5, 2] })(fakeSelf(), 0, 0.001, 0.01, 0, 0)
+		).toEqual([0.001, 0.0015, 0.002, 0.01]);
 	});
 
 	it('emits exact minor ticks inside sub-1 decades', () => {
@@ -459,18 +523,67 @@ describe('splitsForStep', () => {
 		expect(splitsForStep({ step: 10, anchor: 5 })(fakeSelf(), 0, 55, 55, 0, 0)).toEqual([55]);
 	});
 
-	it('refuses a grid whose index is past exact integer precision instead of collapsing it', () => {
+	it('refuses a grid too fine to resolve at the range magnitude, from any anchor', () => {
 		const warn = vi.spyOn(console, 'warn').mockImplementation(() => {});
 		try {
-			// a nanosecond step phased against a Unix-seconds origin puts the first tick at
-			// index ~1.7e18, where `index + 1 === index` — every "tick" would be the same value
-			const splits = splitsForStep({ step: 1e-9 });
+			// a nanosecond step on a Unix-seconds range: doubles there are ~2.4e-7 apart, so the
+			// "grid" would collapse onto a handful of positions. Whether that is detected must
+			// depend on the magnitude the ticks sit at, not on how far the anchor happens to be
+			// from the window — anchoring inside the window used to make the same grid pass
+			// silently and come back with 5 ticks spaced 240x the requested step
+			for (const anchor of [0, 1.7e9, 1.7e9 + 5e-7, -1e6]) {
+				expect(
+					splitsForStep({ step: 1e-9, anchor })(fakeSelf(), 0, 1.7e9, 1.7e9 + 1, 0, 0)
+				).toEqual([]);
+			}
+			expect(warn).toHaveBeenCalled();
 
-			expect(splits(fakeSelf(), 0, 1.7e9, 1.7e9 + 1, 0, 0)).toEqual([]);
-			expect(warn).toHaveBeenCalledOnce();
+			// a microsecond step on a nanosecond epoch is the same failure one unit up: it used
+			// to return 21 ticks with gaps alternating 768 and 1024
+			expect(splitsForStep({ step: 1000 })(fakeSelf(), 0, 1.7e18, 1.7e18 + 20_000, 0, 0)).toEqual(
+				[]
+			);
+
+			// but a millisecond step at that same magnitude resolves fine and is left alone
+			expect(splitsForStep({ step: 1e6 })(fakeSelf(), 0, 1.7e18, 1.7e18 + 2e7, 0, 0).length).toBe(
+				21
+			);
 		} finally {
 			warn.mockRestore();
 		}
+	});
+
+	it('ticks the grid points sitting exactly on scaleMin and scaleMax', () => {
+		// both bounds are real grid positions, and each is lost by a different rounding
+		// direction: 0.07 / 0.01 is 7.000000000000001 so the quotient ceils past the first
+		// tick, while the top point of a 0.15 grid is raw 0.44999999999999996 and only becomes
+		// 0.45 — the value a caller would write down — after rounding
+		expect(splitsForStep({ step: 0.01 })(fakeSelf(), 0, 0.07, 0.11, 0, 0)).toEqual([
+			0.07, 0.08, 0.09, 0.1, 0.11
+		]);
+		expect(splitsForStep({ step: 0.15 })(fakeSelf(), 0, 0, 3 * 0.15, 0, 0)).toEqual([
+			0, 0.15, 0.3, 0.45
+		]);
+		// the same at the lower bound with the opposite rounding direction: the grid point at
+		// -0.4 is raw -0.40000000000000013, a hair below the bound, and rounds up onto it
+		expect(splitsForStep({ step: 0.2, anchor: 1 })(fakeSelf(), 0, -0.4, 0.4, 0, 0)).toEqual([
+			-0.4, -0.2, 0, 0.2, 0.4
+		]);
+		expect(splitsForStep({ step: 0.3 })(fakeSelf(), 0, 2.1, 3.3, 0, 0)).toEqual([
+			2.1, 2.4, 2.7, 3, 3.3
+		]);
+		expect(splitsForStep({ step: 0.1 })(fakeSelf(), 0, -5.8, -5.3, 0, 0)).toEqual([
+			-5.8, -5.7, -5.6, -5.5, -5.4, -5.3
+		]);
+	});
+
+	it('never emits negative zero for a grid phased across the origin', () => {
+		// 0.3 + (-3) * 0.1 is -5.55e-17, which rounds to `-0` and formats as "-0" through
+		// Intl — the tick the caller means is 0
+		const result = splitsForStep({ step: 0.1, anchor: 0.3 })(fakeSelf(), 0, -0.2, 0.2, 0, 0);
+
+		expect(result).toEqual([-0.2, -0.1, 0, 0.1, 0.2]);
+		expect(result.some((value) => Object.is(value, -0))).toBe(false);
 	});
 
 	it('refuses a non-finite anchor rather than emitting NaN ticks', () => {
@@ -495,6 +608,28 @@ describe('splitsForStep', () => {
 			// the range holds 1e9 steps; the walk bails far short of that, once, loudly
 			expect(result.length).toBeLessThan(1e9);
 			expect(warn).toHaveBeenCalledOnce();
+		} finally {
+			warn.mockRestore();
+		}
+	});
+
+	it('reports a capped walk even after an unrelated diagnostic already fired', () => {
+		const warn = vi.spyOn(console, 'warn').mockImplementation(() => {});
+		try {
+			const splits = splitsForStep({ step: 1e-9 });
+
+			// the two conditions are unrelated — an unplaceable grid is fixed by changing the
+			// options, a capped walk by changing the range — so silencing one must not silence
+			// the other on the same factory instance
+			expect(splits(fakeSelf(), 0, 1.7e9, 1.7e9 + 1, 0, 0)).toEqual([]);
+			expect(warn).toHaveBeenCalledOnce();
+
+			expect(splits(fakeSelf(), 0, 0, 1, 0, 0).length).toBeGreaterThan(0);
+			expect(warn).toHaveBeenCalledTimes(2);
+
+			// but a repeat of either condition still stays quiet, per redraw
+			splits(fakeSelf(), 0, 0, 1, 0, 0);
+			expect(warn).toHaveBeenCalledTimes(2);
 		} finally {
 			warn.mockRestore();
 		}
@@ -596,6 +731,17 @@ describe('splitsWithLimit', () => {
 		expect(
 			splitsWithLimit(splitsForStep({ step: 10 }), -Infinity)(fakeSelf(), 0, 0, 30, 0, 0)
 		).toEqual([]);
+	});
+
+	it('floors a fractional max rather than exceeding it', () => {
+		// the natural measurement `plotWidth / labelWidth` is fractional; thinning against the
+		// raw value would bound the result by ceil(max), i.e. hand back 3 ticks for max 2.5
+		const base = splitsForStep({ step: 1 }); // 11 ticks over [0, 10]
+
+		expect(splitsWithLimit(base, 2.5)(fakeSelf(), 0, 0, 10, 0, 0)).toEqual([0, 6]);
+		expect(splitsWithLimit(base, 1.2)(fakeSelf(), 0, 0, 10, 0, 0)).toEqual([0]);
+		// below one label fits, so the axis blanks rather than showing a lone tick
+		expect(splitsWithLimit(base, 0.5)(fakeSelf(), 0, 0, 10, 0, 0)).toEqual([]);
 	});
 
 	it('favours even spacing over hitting max exactly', () => {

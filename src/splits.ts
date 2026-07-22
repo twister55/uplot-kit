@@ -18,6 +18,13 @@ const APPROXIMATE_YEAR = 366 * SECONDS_PER_DAY;
 // unit than seconds is a supported configuration, declared through splitsForTime's `ms`.
 const MAX_TICK_CANDIDATES = 10_000;
 
+// How far an arithmetic grid's spacing may drift from the requested step before stepGrid refuses
+// to place it at all. Adjacent doubles at magnitude `m` are `m * EPSILON` apart, so a step near
+// that size quantizes onto them and an "even" grid comes out visibly uneven. A thousand-fold
+// margin puts the worst-case drift at 0.1% of one step — far under a device pixel on any real
+// axis — while still refusing the cases that are wrong by a third.
+const MAX_GRID_SPACING_ERROR = 1e-3;
+
 /** The `axis.splits` function shape every generator below returns, and every decorator wraps
  * — narrower than uPlot's `Axis.Splits` union (which also allows a static `number[]`), so
  * callers get a directly callable function back instead of having to narrow the union
@@ -62,14 +69,15 @@ function isTickable(scaleMin: number, scaleMax: number): boolean {
 	return Number.isFinite(scaleMin) && Number.isFinite(scaleMax) && scaleMin <= scaleMax;
 }
 
-// One warn-once tracker per generator instance (mirrors the per-factory-call `warnedAboutCap`
-// flag the original timeSplits used), so a chart that redraws every frame on a degenerate
-// range logs once, not per frame.
+// One warn-once tracker per generator instance, so a chart that redraws every frame on a
+// degenerate range logs once, not per frame. Keyed by the message rather than by a single flag:
+// a generator can report structurally unrelated conditions (an unplaceable grid, a capped walk)
+// that are fixed by different things, so silencing one must not silence the others.
 function makeWarnOnce(source: string): (detail: string) => void {
-	let warned = false;
+	const warned = new Set<string>();
 	return (detail) => {
-		if (!warned) {
-			warned = true;
+		if (!warned.has(detail)) {
+			warned.add(detail);
 			console.warn(`uplot-kit ${source}: ${detail}`);
 		}
 	};
@@ -175,15 +183,23 @@ function roundTo(value: number, digits: number): number {
 // The arithmetic tick grid `anchor + k * step`, clamped to [lower, upper] — the shared body of
 // splitsForStep and splitsForCategory (which differs only in clamping its bounds to the category
 // index range first). Every tick is computed from its own index rather than by adding `step` to
-// the previous one, so a fractional step accumulates no drift and the tick sitting exactly on
-// `upper` is never pushed past it. Same candidate cap as walk().
+// the previous one, so a fractional step accumulates no drift. Same candidate cap as walk().
 //
-// That index-based exactness holds only while the index itself is exactly representable: once
-// `firstIndex` approaches 2**53, `firstIndex + k` stops incrementing and every "tick" collapses
-// onto the same value. A grid that far out (a nanosecond step phased against a Unix-seconds
-// anchor, say) is refused outright and said so, rather than silently yielding a one-tick axis
-// that looks like a legitimate result. A non-finite `anchor` lands here too, via a non-finite
-// index.
+// Each grid point has two faithful spellings, differing by at most an ulp: the *raw*
+// `anchor + k * step`, the exact continuation of the caller's own arithmetic, and the *rounded*
+// value actually emitted, which recovers the decimal the caller wrote (`3 * 0.1` becomes 0.3
+// again). A bound test therefore takes whichever of the two falls on the permissive side, because
+// a tick sitting exactly on `lower` or `upper` must not vanish merely because rounding carried it
+// across by one ulp — and it lands on either side depending on the case. With step 0.15 over
+// [0, 3 * 0.15] the top grid point is raw 0.44999999999999996 rounding *up* to the 0.45 the caller
+// wrote, so the rounded form fails the upper bound; with step 0.2 anchored at 1 over [-0.4, 0.4]
+// the bottom one is raw -0.40000000000000013 rounding *up* to -0.4, so the raw form fails the
+// lower bound. Either way the point is the bound, and it gets a tick.
+//
+// So this grid owns its own bounds: what it returns is already ascending, unique and in range,
+// and callers must NOT run it back through normalize(), whose clamp re-tests the rounded values
+// against the raw scale bounds and would undo exactly that decision. An emitted tick can sit up
+// to one ulp outside [lower, upper] — the same point, spelled correctly.
 function stepGrid(
 	anchor: number,
 	step: number,
@@ -192,29 +208,58 @@ function stepGrid(
 	upper: number,
 	into: TickCollector
 ): number[] {
-	const firstIndex = Math.ceil((lower - anchor) / step);
-	if (
-		!Number.isFinite(firstIndex) ||
-		Math.abs(firstIndex) + MAX_TICK_CANDIDATES > Number.MAX_SAFE_INTEGER
-	) {
-		into.warn('step is too small relative to anchor to place an exact tick grid');
+	// Whether a grid is placeable at all is a property of the magnitude its ticks sit at, not of
+	// how far the anchor happens to be from the window: at 1.7e18 a 1000-unit step lands on
+	// doubles 256 apart and alternates 768/1024 gaps no matter where it is anchored from. Keying
+	// on the anchor's phase distance instead judged the same grid differently depending on where
+	// the caller anchored it, refusing it loudly from one anchor and silently collapsing it from
+	// another. A non-finite anchor or bound lands here too, via a non-finite magnitude.
+	const magnitude = Math.max(Math.abs(lower), Math.abs(upper), Math.abs(anchor));
+	if (!(magnitude * Number.EPSILON <= step * MAX_GRID_SPACING_ERROR)) {
+		into.warn('step is too small to place an exact tick grid at this scale');
 		return into.values;
 	}
+
+	const gridValue = (index: number): number => anchor + index * step;
+	const isAtOrAbove = (index: number): boolean => {
+		const raw = gridValue(index);
+		return Math.max(raw, roundTo(raw, digits)) >= lower;
+	};
+
+	// The quotient is float division and can land a hair either side of the true index —
+	// `(0.07 - 0) / 0.01` is 7.000000000000001, which ceils to 8 and skips the tick sitting
+	// exactly on `lower`. The grid itself is the authority, so the quotient is corrected against
+	// it; one step either way is enough, the guard above having bounded the division's error.
+	let firstIndex = Math.ceil((lower - anchor) / step);
+	if (isAtOrAbove(firstIndex - 1)) {
+		firstIndex--;
+	} else if (!isAtOrAbove(firstIndex)) {
+		firstIndex++;
+	}
+
 	for (let k = 0; ; k++) {
-		const value = roundTo(anchor + (firstIndex + k) * step, digits);
-		if (!Number.isFinite(value) || value > upper) {
+		const raw = gridValue(firstIndex + k);
+		if (!Number.isFinite(raw)) {
 			break;
 		}
-		if (!into.push(value)) {
+		const value = roundTo(raw, digits);
+		if (Math.min(raw, value) > upper) {
+			break;
+		}
+		// An anchor that phases the grid across zero produces a raw value a hair below it, which
+		// rounds to `-0` and formats as "-0". Fold it onto the zero the caller means; normalize()
+		// used to launder this through its Set, and the grid now owns its output.
+		if (!into.push(value === 0 ? 0 : value)) {
 			break;
 		}
 	}
 	return into.values;
 }
 
-// Final-output normalization shared by every generator and decorator: dedupe, ascending sort,
-// clamp to the visible range. Decorators in particular rely on this — splitsWithInclude merges two
-// tick sets that can overlap or straddle the range edges.
+// Final-output normalization for tick sets that are not already well-formed: dedupe, ascending
+// sort, clamp to the visible range. splitsWithInclude and splitsWithEdges merge two tick sets that
+// can overlap or straddle the range edges, and splitsForLog's decade sweep deliberately overshoots
+// both ends. stepGrid's callers deliberately skip it — see the note there.
 function normalize(values: number[], scaleMin: number, scaleMax: number): number[] {
 	return [...new Set(values)].filter((v) => v >= scaleMin && v <= scaleMax).sort((a, b) => a - b);
 }
@@ -263,7 +308,11 @@ function startOfYear(sec: number, offsetSec: number, yearDelta = 0): number {
 	return utcMonthStart(shifted.getUTCFullYear() + yearDelta, 0) / 1000 - offsetSec;
 }
 
-/** Coarsest calendar unit {@link splitsForTime} will tick at; larger visible ranges widen to coarser units up this ladder. */
+/**
+ * Finest calendar unit {@link splitsForTime} will tick at — a floor, not a fixed step: finer
+ * units are skipped outright, and larger visible ranges still widen to coarser ones up the
+ * ladder, so a `'month'` axis zoomed out far enough ticks years.
+ */
 export type SplitsForTimeGranularity = 'day' | 'week' | 'month' | 'quarter' | 'year';
 
 // Per-call context the level walkers need beyond the timestamp — kept as one object so a
@@ -364,9 +413,11 @@ export interface SplitsForTimeOptions {
  *
  * Ticks are exactly the calendar boundaries that fall inside the visible range, with no
  * exceptions — like uPlot's own default splits, no range-edge ticks are injected, so every
- * label is a real boundary. Density is governed by the widening ladder (a day-granularity
- * axis shows daily ticks only up to ~10 days, then weekly, monthly, and so on), not by
- * pixel spacing; tune `axis.space` for the crossover width.
+ * label is a real boundary. Density is governed entirely by the widening ladder (a
+ * day-granularity axis shows daily ticks only up to ~10 days, then weekly, monthly, and so
+ * on) — the crossover widths are fixed, and neither `axis.space` nor the `foundIncr` /
+ * `foundSpace` uPlot passes in has any effect on the result. Wrap with
+ * {@link splitsWithLimit} to cap the label count instead.
  *
  * A range too narrow to contain any boundary of the chosen granularity (e.g. an intraday
  * zoom at day granularity, or a zero-width range from single-point data that doesn't sit on
@@ -463,15 +514,21 @@ export interface SplitsForLogOptions {
 
 /**
  * Builds a uPlot `axis.splits` function for a logarithmic axis (`scale.distr: 3`), ticking
- * one point per decade of the configured base, with optional interior (minor) ticks —
- * finer-grained control than uPlot's built-in log splits, which only offer whole-decade
- * ticks with no minor-tick option.
+ * one point per decade of the configured base, with optional interior (minor) ticks.
+ *
+ * What this adds over uPlot's built-in log handling is control over which ticks *exist*.
+ * uPlot already emits every integer mantissa in every decade and then blanks most of the
+ * labels through `axis.filter` — the splits survive, so their gridlines and tick marks
+ * render. So the default here (`minor: false`) is *sparser* than uPlot's own axis, not
+ * denser: it is how you get a decade-only grid. `minorMantissas` covers the other case a
+ * label-only filter cannot express — a thinned interior grid such as `[2, 5]`.
  *
  * Values at or below zero are outside a log scale's domain and produce no ticks (an empty
- * array), since `0` and negative values have no defined position on a log axis. A range too
- * narrow to contain a decade (including a zero-width range that isn't itself a power of
- * `base`) likewise yields nothing; wrap with {@link splitsWithEdges} for a range-edge
- * fallback.
+ * array), since `0` and negative values have no defined position on a log axis. With
+ * `minor: false`, a range too narrow to contain a decade (including a zero-width range that
+ * isn't itself a power of `base`) likewise yields nothing; wrap with {@link splitsWithEdges}
+ * for a range-edge fallback. Minor ticks are placed per decade whether or not the decade
+ * boundary itself is in range, so a `minor: true` axis still ticks inside a sub-decade zoom.
  *
  * @example
  * ```ts
@@ -518,13 +575,16 @@ export function splitsForLog(options: SplitsForLogOptions = {}): SplitsFn {
 			const values = [decade];
 			if (minor) {
 				// A mantissa scaled into a sub-1 decade is inexact (9 * 0.001 is
-				// 0.009000000000000001), so each interior tick is rounded back to the decade's
-				// own precision — the most any tick inside it can carry. Computed inside this
-				// branch so the default (major-only) redraw path never pays for the
-				// string-formatting behind fractionDigits.
-				const digits = fractionDigits(decade);
+				// 0.009000000000000001), so each interior tick is rounded back to the precision
+				// its own two factors carry: the decade's digits plus the mantissa's. Rounding to
+				// the decade's alone would snap a fractional mantissa onto the decade's grid —
+				// 1.5 * 0.5 would tick at 0.8 rather than 0.75 — and fractional mantissas are not
+				// a corner case: base 2 has no integer mantissa to offer, since none exists
+				// between 1 and 2. Computed inside this branch so the default (major-only) redraw
+				// path never pays for the string-formatting behind fractionDigits.
+				const decadeDigits = fractionDigits(decade);
 				for (const mantissa of minorMantissas) {
-					values.push(roundTo(mantissa * decade, digits));
+					values.push(roundTo(mantissa * decade, decadeDigits + fractionDigits(mantissa)));
 				}
 			}
 			if (!collector.pushAll(values)) {
@@ -601,11 +661,9 @@ export function splitsForStep(options: SplitsForStepOptions): SplitsFn {
 			return [];
 		}
 
-		return normalize(
-			stepGrid(anchor, step, digits, scaleMin, scaleMax, makeCollector(warn)),
-			scaleMin,
-			scaleMax
-		);
+		// Not re-normalized: stepGrid already returns an ascending, unique, in-range grid, and
+		// normalize()'s clamp would re-test its rounded ticks against the raw bounds.
+		return stepGrid(anchor, step, digits, scaleMin, scaleMax, makeCollector(warn));
 	};
 }
 
@@ -692,11 +750,7 @@ export function splitsForCategory(options: SplitsForCategoryOptions = {}): Split
 		}
 
 		// Category indices are the zero-anchored case of splitsForStep's own grid.
-		return normalize(
-			stepGrid(0, step, 0, lowerBound, upperBound, makeCollector(warn)),
-			lowerBound,
-			upperBound
-		);
+		return stepGrid(0, step, 0, lowerBound, upperBound, makeCollector(warn));
 	}, domain);
 }
 
@@ -755,9 +809,10 @@ export function splitsWithInclude(inner: SplitsFn, values: number[]): SplitsFn {
  *
  * Even spacing is preserved in preference to hitting `max` exactly: the result keeps every
  * k-th tick for the smallest k that fits under the limit, so a tick set only slightly over
- * `max` can thin well below it (11 ticks with `max: 10` gives 6, at k = 2). `NaN` (from a
- * not-yet-measured label width) and `Infinity` both mean no limit and pass the inner ticks
- * through; a `max` of zero or less — `-Infinity` included — yields no ticks.
+ * `max` can thin well below it (11 ticks with `max: 10` gives 6, at k = 2). A fractional `max`
+ * is floored, so a measured `plotWidth / labelWidth` needs no rounding at the call site.
+ * `NaN` (from a not-yet-measured label width) and `Infinity` both mean no limit and pass the
+ * inner ticks through; a `max` below one — `-Infinity` and zero included — yields no ticks.
  *
  * @example
  * ```ts
@@ -791,13 +846,17 @@ export function splitsWithLimit(inner: SplitsFn, max: number): SplitsFn {
 		if (Number.isNaN(max) || max === Infinity) {
 			return ticks;
 		}
-		if (max <= 0) {
+		// Floored, because a measurement-derived max is the fractional `plotWidth / labelWidth`
+		// and half a label does not fit. Thinning against the raw fraction would bound the
+		// result by ceil(max) instead of max — 11 ticks under `max: 2.5` would return 3.
+		const limit = Math.floor(max);
+		if (limit <= 0) {
 			return [];
 		}
-		if (ticks.length <= max) {
+		if (ticks.length <= limit) {
 			return ticks;
 		}
-		const stride = Math.ceil(ticks.length / max);
+		const stride = Math.ceil(ticks.length / limit);
 		return ticks.filter((_, index) => index % stride === 0);
 	}, inner);
 }
