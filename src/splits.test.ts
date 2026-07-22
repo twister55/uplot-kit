@@ -9,7 +9,8 @@ import {
 	splitsWithEdges,
 	splitsWithFilter,
 	splitsWithInclude,
-	splitsWithLimit
+	splitsWithLimit,
+	type SplitsForTimeGranularity
 } from './splits';
 
 // splitsForTime reads nothing off the uPlot instance, so an empty stub stands in for it.
@@ -88,6 +89,30 @@ describe('splitsForTime', () => {
 		expect(
 			splitsForTime({ granularity: 'month' })(fakeSelf(), 0, scaleMin, scaleMax, 0, 0)
 		).toEqual([unixSec('2026-01-01T00:00:00Z')]);
+	});
+
+	it('warns once and falls back to the default for an unrecognized granularity', () => {
+		const warn = vi.spyOn(console, 'warn').mockImplementation(() => {});
+		try {
+			// only reachable from JS or a cast config string; silently picking a rung would be a
+			// guess, and the guess used to be the finest one — the opposite of what a caller
+			// asking for a coarse granularity wanted
+			const splits = splitsForTime({ granularity: 'Month' as SplitsForTimeGranularity });
+			const scaleMin = unixSec('2026-01-01T00:00:00Z');
+			const scaleMax = unixSec('2026-01-06T00:00:00Z');
+
+			expect(splits(fakeSelf(), 0, scaleMin, scaleMax, 0, 0)).toEqual(
+				splitsForTime({ granularity: 'day' })(fakeSelf(), 0, scaleMin, scaleMax, 0, 0)
+			);
+			expect(warn).toHaveBeenCalledOnce();
+			expect(warn.mock.calls[0]?.[0]).toContain('unknown granularity "Month"');
+
+			// diagnosed at factory time, so redraws stay quiet
+			splits(fakeSelf(), 0, scaleMin, scaleMax, 0, 0);
+			expect(warn).toHaveBeenCalledOnce();
+		} finally {
+			warn.mockRestore();
+		}
 	});
 
 	it('ticks quarter starts, not arbitrary three-month offsets', () => {

@@ -342,6 +342,11 @@ const YEAR_LEVEL: SplitLevel = {
 	getNextValue: (currentValue, ctx) => startOfYear(currentValue, ctx.offsetSec, 1)
 };
 
+// The granularity an omitted or unrecognized option resolves to. It is deliberately the ladder's
+// first entry — falling back to it means keeping every rung, which is what `slice(0)` below
+// expresses — so moving it here would need that slice to look the index up instead.
+const DEFAULT_GRANULARITY: SplitsForTimeGranularity = 'day';
+
 const SPLIT_LEVELS: SplitLevel[] = [
 	{
 		granularity: 'day',
@@ -376,6 +381,10 @@ export interface SplitsForTimeOptions {
 	 * aggregated to monthly buckets should pass `'month'` so ticks never land inside a
 	 * bucket. Finer levels (day/week) are skipped; coarser ones (year) still kick in
 	 * once the visible range grows large enough.
+	 *
+	 * A value outside the union — reachable from JavaScript, or from a config string
+	 * typed through a cast — warns once and falls back to the default rather than
+	 * throwing, so a stale value in saved config costs a denser axis, not the chart.
 	 * @default 'day'
 	 */
 	granularity?: SplitsForTimeGranularity;
@@ -448,11 +457,25 @@ export interface SplitsForTimeOptions {
  * ```
  */
 export function splitsForTime(options: SplitsForTimeOptions = {}): SplitsFn {
-	const { granularity = 'day', ms = 1e-3, offsetSec = 0, weekStartsOn = 0 } = options;
-	const startIdx = SPLIT_LEVELS.findIndex((level) => level.granularity === granularity);
-	const levels = SPLIT_LEVELS.slice(startIdx < 0 ? 0 : startIdx);
+	const { granularity = DEFAULT_GRANULARITY, ms = 1e-3, offsetSec = 0, weekStartsOn = 0 } = options;
 	const ctx: SplitContext = { offsetSec, weekStartsOn };
 	const warn = makeWarnOnce('splitsForTime');
+
+	// A granularity outside the union can only arrive from a JS caller or a config string, and
+	// unlike a non-positive `step` it has no "nothing to tick" reading — so picking a rung for it
+	// is a guess, not a degenerate answer. Left silent, the guess was the *finest* rung, which is
+	// the opposite of what a caller asking for a coarse granularity wanted: a typo like 'Month'
+	// quietly restored the intra-bucket ticks the option exists to suppress. Say so once, at
+	// factory time, and behave as if the option had been omitted. Warning rather than throwing
+	// because this reaches production through data-driven config, where a stale enum value should
+	// cost a denser axis, not the whole chart.
+	const startIdx = SPLIT_LEVELS.findIndex((level) => level.granularity === granularity);
+	if (startIdx < 0) {
+		warn(
+			`unknown granularity ${JSON.stringify(granularity)} — falling back to '${DEFAULT_GRANULARITY}'`
+		);
+	}
+	const levels = SPLIT_LEVELS.slice(startIdx < 0 ? 0 : startIdx);
 	// Axis units per second, derived the same way uPlot derives its own: it reads a timestamp
 	// as `new Date(value / ms)` milliseconds, so a second is `1000 * ms` axis units — exactly
 	// 1 for the seconds default (`1000 * 1e-3` is exact) and 1000 for a millisecond axis.
