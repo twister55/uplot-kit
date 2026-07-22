@@ -1,0 +1,811 @@
+// uPlot `axis.splits` generators and decorators: a set of factories producing the tick-
+// position function shape uPlot's `axis.splits` accepts, plus decorators (`SplitsFn =>
+// SplitsFn`) that wrap any of them to inject, filter, or thin ticks. Where `incrs` answers
+// "which step sizes are allowed" (uPlot then builds an even grid from one), `splits` answers
+// "where exactly do ticks land" — the full override uPlot's own evenly-spaced default can't
+// express calendar-irregular (splitsForTime), logarithmic (splitsForLog), or anchored (splitsForStep)
+// tick placement.
+
+import type uPlot from 'uplot';
+
+const SECONDS_PER_DAY = 60 * 60 * 24;
+const SECONDS_PER_WEEK = 7 * SECONDS_PER_DAY;
+const APPROXIMATE_YEAR = 366 * SECONDS_PER_DAY;
+
+// Shared cap for every generator's tick walk — bites only on absurd ranges (e.g. millisecond
+// or nanosecond epoch values fed to a seconds axis), turning unbounded per-redraw work into a
+// bounded walk with one loud warning per generator instance.
+const MAX_TICK_CANDIDATES = 10_000;
+
+/** The `axis.splits` function shape every generator below returns, and every decorator wraps
+ * — narrower than uPlot's `Axis.Splits` union (which also allows a static `number[]`), so
+ * callers get a directly callable function back instead of having to narrow the union
+ * themselves. */
+export interface SplitsFn {
+	(
+		self: uPlot,
+		axisIdx: number,
+		scaleMin: number,
+		scaleMax: number,
+		foundIncr: number,
+		foundSpace: number
+	): number[];
+	/**
+	 * Optional narrowing of the range this function considers tickable at all; see
+	 * {@link SplitsDomainFn}. Set by {@link splitsForCategory} (whose `count` excludes the
+	 * padded region past the last category) and propagated by every decorator; a custom
+	 * `SplitsFn` with a domain narrower than the scale range can set it too.
+	 */
+	domain?: SplitsDomainFn;
+}
+
+/**
+ * The sub-range of `[scaleMin, scaleMax]` on which a {@link SplitsFn} considers ticks
+ * meaningful, as an inclusive `[lower, upper]` pair. Decorators that inject ticks of their
+ * own — {@link splitsWithEdges}, {@link splitsWithInclude} — clamp to it instead of the raw
+ * scale range, so wrapping a generator can never re-introduce a tick the generator itself
+ * refuses to emit. An inverted or non-finite pair means "nothing here is tickable".
+ */
+export type SplitsDomainFn = (scaleMin: number, scaleMax: number) => [number, number];
+
+// --- Shared helpers (private) ---
+
+// Degenerate-range guard common to every generator below: non-finite bounds and an inverted
+// range both mean "nothing sensible to tick". A zero-width range — the one case uPlot itself
+// passes through unpadded (single-point data) — is deliberately *not* special-cased: letting
+// it flow through the generator's own grid means the collapsed value ticks only when it is a
+// real grid position (a calendar boundary, a decade, a step multiple), instead of becoming the
+// single off-grid tick the generator would never otherwise emit. splitsWithEdges is how a
+// caller opts into a tick there regardless.
+function isTickable(scaleMin: number, scaleMax: number): boolean {
+	return Number.isFinite(scaleMin) && Number.isFinite(scaleMax) && scaleMin <= scaleMax;
+}
+
+// One warn-once tracker per generator instance (mirrors the per-factory-call `warnedAboutCap`
+// flag the original timeSplits used), so a chart that redraws every frame on a degenerate
+// range logs once, not per frame.
+function makeWarnOnce(source: string): (detail: string) => void {
+	let warned = false;
+	return (detail) => {
+		if (!warned) {
+			warned = true;
+			console.warn(`uplot-kit ${source}: ${detail}`);
+		}
+	};
+}
+
+const CAP_REACHED = `stopped after ${MAX_TICK_CANDIDATES} tick candidates — the scale range looks degenerate`;
+
+// The one candidate cap every generator shares. `push` reports whether the caller may keep
+// going, so the three shapes of tick generation below — the calendar walk, the arithmetic
+// grid, the log decade sweep — stop on a single convention rather than three subtly different
+// off-by-ones. Values below the eventual scaleMin are not filtered here — normalize() does
+// that — so the cap counts every candidate the same way regardless of where the visible
+// window starts.
+type TickCollector = {
+	values: number[];
+	push: (value: number) => boolean;
+	pushAll: (values: number[]) => boolean;
+	warn: (detail: string) => void;
+};
+
+function makeCollector(warn: (detail: string) => void): TickCollector {
+	const values: number[] = [];
+	const push = (value: number): boolean => {
+		if (values.length >= MAX_TICK_CANDIDATES) {
+			warn(CAP_REACHED);
+			return false;
+		}
+		values.push(value);
+		return true;
+	};
+	// `every` short-circuits on the first refusal, so a capped batch stops mid-way like a
+	// hand-rolled loop would.
+	return { values, push, pushAll: (more) => more.every((value) => push(value)), warn };
+}
+
+// Walks from `from` while `<= max`, advancing via `next`. Used only by splitsForTime, whose
+// steps are calendar-irregular; the arithmetic generators go through stepGrid() instead,
+// which is drift-free.
+function walk(
+	from: number,
+	max: number,
+	next: (value: number) => number,
+	into: TickCollector
+): number[] {
+	let value = from;
+	while (Number.isFinite(value) && value <= max) {
+		if (!into.push(value)) {
+			break;
+		}
+		value = next(value);
+	}
+	return into.values;
+}
+
+// Attaches a domain to a freshly built SplitsFn; see SplitsDomainFn.
+function withDomain(splits: SplitsFn, domain: SplitsDomainFn): SplitsFn {
+	splits.domain = domain;
+	return splits;
+}
+
+// The range a decorator may inject ticks into: the inner function's own domain when it
+// declares one, the raw scale range otherwise.
+function domainOf(inner: SplitsFn, scaleMin: number, scaleMax: number): [number, number] {
+	return inner.domain?.(scaleMin, scaleMax) ?? [scaleMin, scaleMax];
+}
+
+// Decorators re-publish their inner function's domain so a chain of them keeps the narrowing
+// instead of dropping it at the first wrap.
+function inheritDomain(wrapped: SplitsFn, inner: SplitsFn): SplitsFn {
+	return inner.domain === undefined ? wrapped : withDomain(wrapped, inner.domain);
+}
+
+// Number of digits after the decimal point in `value`'s own shortest decimal form, used to
+// round a computed tick back to exactly the precision its inputs carry. Exponential notation
+// (`1e-7`, whose string form has no decimal point at all) is handled by folding the exponent
+// into the mantissa's own digit count.
+function fractionDigits(value: number): number {
+	if (!Number.isFinite(value)) {
+		return 0;
+	}
+	const text = Math.abs(value).toString();
+	const exponentAt = text.indexOf('e');
+	if (exponentAt >= 0) {
+		const exponent = Number(text.slice(exponentAt + 1));
+		return Math.max(0, fractionDigits(Number(text.slice(0, exponentAt))) - exponent);
+	}
+	const dotAt = text.indexOf('.');
+	return dotAt < 0 ? 0 : text.length - dotAt - 1;
+}
+
+// Rounds a grid value to `digits` decimals, undoing the representation error that even exact
+// index math carries for fractional steps (`3 * 0.1 === 0.30000000000000004`). Past 15 digits a
+// double has no precision left to round to, so the value passes through untouched rather than
+// overflowing the 10**digits factor.
+function roundTo(value: number, digits: number): number {
+	if (digits <= 0 || digits > 15 || !Number.isFinite(value)) {
+		return value;
+	}
+	const factor = 10 ** digits;
+	return Math.round(value * factor) / factor;
+}
+
+// The arithmetic tick grid `anchor + k * step`, clamped to [lower, upper] — the shared body of
+// splitsForStep and splitsForCategory (which differs only in clamping its bounds to the category
+// index range first). Every tick is computed from its own index rather than by adding `step` to
+// the previous one, so a fractional step accumulates no drift and the tick sitting exactly on
+// `upper` is never pushed past it. Same candidate cap as walk().
+//
+// That index-based exactness holds only while the index itself is exactly representable: once
+// `firstIndex` approaches 2**53, `firstIndex + k` stops incrementing and every "tick" collapses
+// onto the same value. A grid that far out (a nanosecond step phased against a Unix-seconds
+// anchor, say) is refused outright and said so, rather than silently yielding a one-tick axis
+// that looks like a legitimate result. A non-finite `anchor` lands here too, via a non-finite
+// index.
+function stepGrid(
+	anchor: number,
+	step: number,
+	digits: number,
+	lower: number,
+	upper: number,
+	into: TickCollector
+): number[] {
+	const firstIndex = Math.ceil((lower - anchor) / step);
+	if (
+		!Number.isFinite(firstIndex) ||
+		Math.abs(firstIndex) + MAX_TICK_CANDIDATES > Number.MAX_SAFE_INTEGER
+	) {
+		into.warn('step is too small relative to anchor to place an exact tick grid');
+		return into.values;
+	}
+	for (let k = 0; ; k++) {
+		const value = roundTo(anchor + (firstIndex + k) * step, digits);
+		if (!Number.isFinite(value) || value > upper) {
+			break;
+		}
+		if (!into.push(value)) {
+			break;
+		}
+	}
+	return into.values;
+}
+
+// Final-output normalization shared by every generator and decorator: dedupe, ascending sort,
+// clamp to the visible range. Decorators in particular rely on this — splitsWithInclude merges two
+// tick sets that can overlap or straddle the range edges.
+function normalize(values: number[], scaleMin: number, scaleMax: number): number[] {
+	return [...new Set(values)].filter((v) => v >= scaleMin && v <= scaleMax).sort((a, b) => a - b);
+}
+
+// --- splitsForTime ---
+
+// Fixed-offset calendar math: axis values are plain Unix seconds, and Date's UTC
+// getters/setters ignore the host's own timezone entirely — so shifting a timestamp
+// by `offsetSec` before reading or writing UTC fields places calendar boundaries
+// (day/week/month/year starts) at that fixed offset instead of the browser's local
+// timezone, and shifting back afterwards returns a value in the original units. This
+// mirrors the `offsetSec` convention used by the `timeRegions` plugin, so both agree
+// on where a "day" starts for a given offset.
+function startOfDay(sec: number, offsetSec: number): number {
+	const shifted = sec + offsetSec;
+	return Math.floor(shifted / SECONDS_PER_DAY) * SECONDS_PER_DAY - offsetSec;
+}
+
+function startOfWeek(sec: number, offsetSec: number, weekStartsOn: number): number {
+	const dayStart = startOfDay(sec, offsetSec);
+	const dayOfWeek = new Date((dayStart + offsetSec) * 1000).getUTCDay(); // 0 = Sunday
+	const daysSinceWeekStart = (dayOfWeek - weekStartsOn + 7) % 7;
+	return dayStart - daysSinceWeekStart * SECONDS_PER_DAY;
+}
+
+// Date.UTC maps years 0-99 to 1900-1999; setUTCFullYear does not, so month/year math stays
+// correct across the whole Date range. The month is normalised by hand because setUTCFullYear
+// applies the year before the month, so a rolled-over month (e.g. 11 + 3) would otherwise
+// land in the wrong year. An out-of-range input propagates NaN, which the tick walk treats
+// as "stop".
+function utcMonthStart(year: number, month: number): number {
+	const date = new Date(0);
+	date.setUTCFullYear(year + Math.floor(month / 12), ((month % 12) + 12) % 12, 1);
+	return date.getTime();
+}
+
+function startOfMonth(sec: number, offsetSec: number, monthDelta = 0): number {
+	const shifted = new Date((sec + offsetSec) * 1000);
+	return (
+		utcMonthStart(shifted.getUTCFullYear(), shifted.getUTCMonth() + monthDelta) / 1000 - offsetSec
+	);
+}
+
+function startOfYear(sec: number, offsetSec: number, yearDelta = 0): number {
+	const shifted = new Date((sec + offsetSec) * 1000);
+	return utcMonthStart(shifted.getUTCFullYear() + yearDelta, 0) / 1000 - offsetSec;
+}
+
+/** Coarsest calendar unit {@link splitsForTime} will tick at; larger visible ranges widen to coarser units up this ladder. */
+export type SplitsForTimeGranularity = 'day' | 'week' | 'month' | 'quarter' | 'year';
+
+// Per-call context the level walkers need beyond the timestamp — kept as one object so a
+// new locale/offset knob (like weekStartsOn) is threaded without widening every closure's
+// signature.
+type SplitContext = { offsetSec: number; weekStartsOn: number };
+
+type SplitLevel = {
+	granularity: SplitsForTimeGranularity;
+	rangeLimit: number;
+	getInitialValue: (scaleMin: number, ctx: SplitContext) => number;
+	getNextValue: (currentValue: number, ctx: SplitContext) => number;
+};
+
+// Widening ladder of calendar-aligned tick steps, ordered finest → coarsest. The splits
+// function starts at the level matching the requested granularity and picks the first whose
+// rangeLimit covers the current scale range, so ticks land on round calendar boundaries
+// (day/week/month/quarter/year starts) rather than arbitrary equal-width divisions. Each
+// level is keyed by its granularity name so selection has a single source of truth (no
+// parallel step table to drift out of sync).
+// The coarsest level, named so the level lookup below has a total fallback the compiler can
+// see is defined (its rangeLimit is Infinity, so the lookup never actually misses).
+const YEAR_LEVEL: SplitLevel = {
+	granularity: 'year',
+	rangeLimit: Infinity,
+	getInitialValue: (scaleMin, ctx) => startOfYear(scaleMin, ctx.offsetSec),
+	getNextValue: (currentValue, ctx) => startOfYear(currentValue, ctx.offsetSec, 1)
+};
+
+const SPLIT_LEVELS: SplitLevel[] = [
+	{
+		granularity: 'day',
+		rangeLimit: SECONDS_PER_DAY * 10,
+		getInitialValue: (scaleMin, ctx) => startOfDay(scaleMin, ctx.offsetSec),
+		getNextValue: (currentValue) => currentValue + SECONDS_PER_DAY
+	},
+	{
+		granularity: 'week',
+		rangeLimit: SECONDS_PER_WEEK * 10,
+		getInitialValue: (scaleMin, ctx) => startOfWeek(scaleMin, ctx.offsetSec, ctx.weekStartsOn),
+		getNextValue: (currentValue) => currentValue + SECONDS_PER_WEEK
+	},
+	{
+		granularity: 'month',
+		rangeLimit: APPROXIMATE_YEAR,
+		getInitialValue: (scaleMin, ctx) => startOfMonth(scaleMin, ctx.offsetSec),
+		getNextValue: (currentValue, ctx) => startOfMonth(currentValue, ctx.offsetSec, 1)
+	},
+	{
+		granularity: 'quarter',
+		rangeLimit: 3 * APPROXIMATE_YEAR,
+		getInitialValue: (scaleMin, ctx) => startOfYear(scaleMin, ctx.offsetSec),
+		getNextValue: (currentValue, ctx) => startOfMonth(currentValue, ctx.offsetSec, 3)
+	},
+	YEAR_LEVEL
+];
+
+export interface SplitsForTimeOptions {
+	/**
+	 * Finest granularity the axis's own data resolution justifies — e.g. a chart
+	 * aggregated to monthly buckets should pass `'month'` so ticks never land inside a
+	 * bucket. Finer levels (day/week) are skipped; coarser ones (year) still kick in
+	 * once the visible range grows large enough.
+	 * @default 'day'
+	 */
+	granularity?: SplitsForTimeGranularity;
+	/**
+	 * Fixed UTC offset, in seconds, used only to place calendar boundaries (day/week/
+	 * month/year starts) — axis values themselves stay in whatever unit the caller
+	 * already uses (Unix seconds). Match this to the `offsetSec` passed to
+	 * `timeRegions` so both agree on where a day starts.
+	 * @default 0
+	 */
+	offsetSec?: number;
+	/**
+	 * Day of week a `'week'`-granularity tick starts on, `0` = Sunday … `6` = Saturday.
+	 * Set to `1` for ISO-8601 / European Monday-start weeks.
+	 * @default 0
+	 */
+	weekStartsOn?: 0 | 1 | 2 | 3 | 4 | 5 | 6;
+}
+
+/**
+ * Builds a uPlot `axis.splits` function that ticks a time axis on round calendar
+ * boundaries (day/week/month/quarter/year starts) instead of uPlot's evenly-spaced
+ * default, widening to a coarser step as the visible range grows.
+ *
+ * Ticks are exactly the calendar boundaries that fall inside the visible range, with no
+ * exceptions — like uPlot's own default splits, no range-edge ticks are injected, so every
+ * label is a real boundary. Density is governed by the widening ladder (a day-granularity
+ * axis shows daily ticks only up to ~10 days, then weekly, monthly, and so on), not by
+ * pixel spacing; tune `axis.space` for the crossover width.
+ *
+ * A range too narrow to contain any boundary of the chosen granularity (e.g. an intraday
+ * zoom at day granularity, or a zero-width range from single-point data that doesn't sit on
+ * a boundary) therefore yields no ticks at all. Wrap with {@link splitsWithEdges} to fall
+ * back to the range edges instead of a blank axis:
+ * `splitsWithEdges(splitsForTime({ granularity: 'day' }))`.
+ *
+ * @example
+ * ```ts
+ * import uPlot from 'uplot';
+ * import { splitsForTime } from 'uplot-kit';
+ *
+ * const opts: uPlot.Options = {
+ *   width: 800,
+ *   height: 400,
+ *   series: [{}, { label: 'value' }],
+ *   axes: [{ splits: splitsForTime({ granularity: 'day' }) }, {}]
+ * };
+ * ```
+ */
+export function splitsForTime(options: SplitsForTimeOptions = {}): SplitsFn {
+	const { granularity = 'day', offsetSec = 0, weekStartsOn = 0 } = options;
+	const startIdx = SPLIT_LEVELS.findIndex((level) => level.granularity === granularity);
+	const levels = SPLIT_LEVELS.slice(startIdx < 0 ? 0 : startIdx);
+	const ctx: SplitContext = { offsetSec, weekStartsOn };
+	const warn = makeWarnOnce('splitsForTime');
+
+	return (_self, _axisIdx, scaleMin, scaleMax) => {
+		if (!isTickable(scaleMin, scaleMax)) {
+			return [];
+		}
+
+		const range = scaleMax - scaleMin;
+		// isTickable has already rejected non-finite bounds, so `range` is finite and the
+		// Infinity-limited coarsest level always matches; the fallback is only for the type.
+		const level = levels.find((candidate) => range <= candidate.rangeLimit) ?? YEAR_LEVEL;
+
+		return normalize(
+			walk(
+				level.getInitialValue(scaleMin, ctx),
+				scaleMax,
+				(currentValue) => level.getNextValue(currentValue, ctx),
+				makeCollector(warn)
+			),
+			scaleMin,
+			scaleMax
+		);
+	};
+}
+
+// --- splitsForLog ---
+
+export interface SplitsForLogOptions {
+	/**
+	 * Log-scale base — `10` for decimal decades (matching uPlot's default `distr: 3` /
+	 * `log: 10`), `2` for binary decades (`log: 2`).
+	 * @default 10
+	 */
+	base?: 10 | 2;
+	/**
+	 * Also emit interior (non-power-of-`base`) ticks within each decade, not just the
+	 * decade boundary itself.
+	 * @default false
+	 */
+	minor?: boolean;
+	/**
+	 * Mantissas multiplied onto each decade to produce interior ticks when `minor` is
+	 * set — e.g. `[2, 5]` for a sparser 1-2-5 minor grid instead of every integer.
+	 * @default `[2, 3, 4, 5, 6, 7, 8, 9]` for `base: 10`; `[]` (no interior ticks) for `base: 2`
+	 */
+	minorMantissas?: number[];
+}
+
+/**
+ * Builds a uPlot `axis.splits` function for a logarithmic axis (`scale.distr: 3`), ticking
+ * one point per decade of the configured base, with optional interior (minor) ticks —
+ * finer-grained control than uPlot's built-in log splits, which only offer whole-decade
+ * ticks with no minor-tick option.
+ *
+ * Values at or below zero are outside a log scale's domain and produce no ticks (an empty
+ * array), since `0` and negative values have no defined position on a log axis. A range too
+ * narrow to contain a decade (including a zero-width range that isn't itself a power of
+ * `base`) likewise yields nothing; wrap with {@link splitsWithEdges} for a range-edge
+ * fallback.
+ *
+ * @example
+ * ```ts
+ * import uPlot from 'uplot';
+ * import { splitsForLog } from 'uplot-kit';
+ *
+ * const opts: uPlot.Options = {
+ *   width: 800,
+ *   height: 400,
+ *   series: [{}, { label: 'response time' }],
+ *   scales: { y: { distr: 3, log: 10 } },
+ *   axes: [{}, { splits: splitsForLog({ base: 10, minor: true }) }]
+ * };
+ * ```
+ */
+export function splitsForLog(options: SplitsForLogOptions = {}): SplitsFn {
+	const {
+		base = 10,
+		minor = false,
+		minorMantissas = base === 10 ? [2, 3, 4, 5, 6, 7, 8, 9] : []
+	} = options;
+	const warn = makeWarnOnce('splitsForLog');
+
+	return (_self, _axisIdx, scaleMin, scaleMax) => {
+		if (!isTickable(scaleMin, scaleMax) || scaleMin <= 0) {
+			return [];
+		}
+
+		const logBase = Math.log(base);
+		const firstPower = Math.floor(Math.log(scaleMin) / logBase);
+		const lastPower = Math.ceil(Math.log(scaleMax) / logBase);
+
+		const collector = makeCollector(warn);
+		for (let power = firstPower; power <= lastPower; power++) {
+			const decade = base ** power;
+			const values = [decade];
+			if (minor) {
+				// A mantissa scaled into a sub-1 decade is inexact (9 * 0.001 is
+				// 0.009000000000000001), so each interior tick is rounded back to the decade's
+				// own precision — the most any tick inside it can carry. Computed inside this
+				// branch so the default (major-only) redraw path never pays for the
+				// string-formatting behind fractionDigits.
+				const digits = fractionDigits(decade);
+				for (const mantissa of minorMantissas) {
+					values.push(roundTo(mantissa * decade, digits));
+				}
+			}
+			if (!collector.pushAll(values)) {
+				break;
+			}
+		}
+
+		return normalize(collector.values, scaleMin, scaleMax);
+	};
+}
+
+// --- splitsForStep ---
+
+export interface SplitsForStepOptions {
+	/** Fixed spacing between ticks, in axis units. */
+	step: number;
+	/**
+	 * Axis value the tick grid is phased against — ticks land at `anchor + k * step`
+	 * for integer `k`, so a step that doesn't divide evenly into round axis values
+	 * (e.g. a 15-minute candle series starting mid-hour) still ticks on-bucket.
+	 * @default 0
+	 */
+	anchor?: number;
+}
+
+/**
+ * Builds a uPlot `axis.splits` function that ticks strictly on multiples of a fixed step
+ * from an anchor — the `axis.splits` counterpart to pinning `axis.incrs` to one step, for
+ * axes where the tick *position* (not just the allowed step size) must land exactly on
+ * bucket boundaries, e.g. candle charts whose session doesn't start on a round wall-clock
+ * value.
+ *
+ * Only real grid positions are emitted, so a range containing none — including a zero-width
+ * range whose single value is off-grid — yields no ticks; wrap with {@link splitsWithEdges}
+ * for a range-edge fallback.
+ *
+ * @example
+ * ```ts
+ * import uPlot from 'uplot';
+ * import { splitsForStep } from 'uplot-kit';
+ *
+ * const opts: uPlot.Options = {
+ *   width: 800,
+ *   height: 400,
+ *   series: [{}, { label: 'close' }],
+ *   // ticks every 15-minute candle (900s), phased to a 09:30 session open
+ *   axes: [{ splits: splitsForStep({ step: 900, anchor: 9.5 * 3600 }) }, {}]
+ * };
+ * ```
+ */
+export function splitsForStep(options: SplitsForStepOptions): SplitsFn {
+	const { step, anchor = 0 } = options;
+	const warn = makeWarnOnce('splitsForStep');
+	// A tick is only ever as precise as the two numbers that define the grid, so rounding to
+	// whichever of them carries more decimals removes float noise without moving a tick the
+	// caller could have written down themselves.
+	const digits = Math.max(fractionDigits(step), fractionDigits(anchor));
+
+	return (_self, _axisIdx, scaleMin, scaleMax) => {
+		if (!isTickable(scaleMin, scaleMax) || !(step > 0)) {
+			return [];
+		}
+
+		return normalize(
+			stepGrid(anchor, step, digits, scaleMin, scaleMax, makeCollector(warn)),
+			scaleMin,
+			scaleMax
+		);
+	};
+}
+
+// --- splitsForCategory ---
+
+export interface SplitsForCategoryOptions {
+	/**
+	 * Total number of categories on the axis. When set, ticks are clamped to the valid
+	 * index range `[0, count - 1]` — uPlot pads an ordinal scale (`distr: 2`) like any
+	 * other, and the padded region past the last category has no real value to tick on.
+	 * @default undefined — no clamping beyond the visible scale range
+	 */
+	count?: number;
+	/**
+	 * Emit every Nth category index instead of every index, e.g. `2` to label every
+	 * other bar on a dense category axis. Must be a positive integer — category indices
+	 * are whole numbers, so a fractional step has no valid tick to land on and yields no
+	 * ticks at all rather than half-index ones with no category behind them.
+	 * @default 1
+	 */
+	step?: number;
+}
+
+/**
+ * Builds a uPlot `axis.splits` function for a category/ordinal axis (`scale.distr: 2`),
+ * ticking on integer indices — every category by default, or every `step`-th one to
+ * thin a dense axis. Pass `count` (the number of categories) so ticks never land in the
+ * padded region past the last real category.
+ *
+ * @example
+ * ```ts
+ * import uPlot from 'uplot';
+ * import { splitsForCategory } from 'uplot-kit';
+ *
+ * const categories = ['mon', 'tue', 'wed', 'thu', 'fri'];
+ * const opts: uPlot.Options = {
+ *   width: 800,
+ *   height: 400,
+ *   series: [{}, { label: 'value' }],
+ *   scales: { x: { distr: 2 } },
+ *   axes: [
+ *     {
+ *       splits: splitsForCategory({ count: categories.length }),
+ *       values: (_u, ticks) => ticks.map((i) => categories[i] ?? '')
+ *     },
+ *     {}
+ *   ]
+ * };
+ * ```
+ */
+export function splitsForCategory(options: SplitsForCategoryOptions = {}): SplitsFn {
+	const { count, step = 1 } = options;
+	const warn = makeWarnOnce('splitsForCategory');
+	// Category indices are whole numbers by construction, so a fractional step describes no
+	// reachable tick — and the grid never needs the decimal rounding the other generators do.
+	const usableStep = Number.isInteger(step) && step > 0;
+
+	// Published as this function's domain (see SplitsDomainFn) so a decorator wrapped around
+	// it — splitsWithEdges in particular — injects its own ticks into the real category range
+	// rather than back into the padding `count` exists to exclude.
+	const domain: SplitsDomainFn = (scaleMin, scaleMax) =>
+		count === undefined
+			? [scaleMin, scaleMax]
+			: [Math.max(scaleMin, 0), Math.min(scaleMax, count - 1)];
+
+	return withDomain((_self, _axisIdx, scaleMin, scaleMax) => {
+		if (!usableStep) {
+			return [];
+		}
+
+		const [lowerBound, upperBound] = domain(scaleMin, scaleMax);
+		if (!isTickable(lowerBound, upperBound)) {
+			return [];
+		}
+
+		// Category indices are the zero-anchored case of splitsForStep's own grid.
+		return normalize(
+			stepGrid(0, step, 0, lowerBound, upperBound, makeCollector(warn)),
+			lowerBound,
+			upperBound
+		);
+	}, domain);
+}
+
+// --- Decorators (SplitsFn => SplitsFn) ---
+
+/**
+ * Wraps a `SplitsFn` so its output always includes the given values — e.g. a zero baseline
+ * or an alert threshold — in addition to whatever the inner function ticks. The merged tick
+ * set is deduplicated, sorted, and clamped back to the visible range, same as any generator's
+ * own output: a value outside the current range is dropped rather than extending the axis, so
+ * pin the scale (`scales.y.range`) if a threshold must stay visible while the user zooms.
+ *
+ * When the inner function declares a narrower {@link SplitsFn.domain} (as
+ * {@link splitsForCategory} does with `count`), values are clamped to that instead of the raw
+ * range, so wrapping can't re-introduce a tick the generator itself refuses to emit.
+ *
+ * @example
+ * ```ts
+ * import uPlot from 'uplot';
+ * import { splitsWithInclude, splitsForStep } from 'uplot-kit';
+ *
+ * const ERROR_BUDGET = 99.9;
+ *
+ * const opts: uPlot.Options = {
+ *   width: 800,
+ *   height: 400,
+ *   series: [{}, { label: 'availability' }],
+ *   scales: { y: { range: [99, 100] } },
+ *   axes: [{}, { splits: splitsWithInclude(splitsForStep({ step: 0.25 }), [ERROR_BUDGET]) }]
+ * };
+ * ```
+ */
+export function splitsWithInclude(inner: SplitsFn, values: number[]): SplitsFn {
+	return inheritDomain((self, axisIdx, scaleMin, scaleMax, foundIncr, foundSpace) => {
+		const [lower, upper] = domainOf(inner, scaleMin, scaleMax);
+		return normalize(
+			[...inner(self, axisIdx, scaleMin, scaleMax, foundIncr, foundSpace), ...values],
+			lower,
+			upper
+		);
+	}, inner);
+}
+
+/**
+ * Wraps a `SplitsFn` so it never returns more than `max` ticks, thinning evenly (keeping
+ * every k-th tick) when the inner function returns more — a guard against overlapping labels
+ * on a dense axis. Thinning is by tick count, not measured label pixel width; pair with
+ * `axis.rotate` or a shorter label formatter for tight spaces.
+ *
+ * Even spacing is preserved in preference to hitting `max` exactly: the result keeps every
+ * k-th tick for the smallest k that fits under the limit, so a tick set only slightly over
+ * `max` can thin well below it (11 ticks with `max: 10` gives 6, at k = 2). `NaN` (from a
+ * not-yet-measured label width) and `Infinity` both mean no limit and pass the inner ticks
+ * through; a `max` of zero or less — `-Infinity` included — yields no ticks.
+ *
+ * @example
+ * ```ts
+ * import uPlot from 'uplot';
+ * import { splitsWithLimit, splitsForTime } from 'uplot-kit';
+ *
+ * const opts: uPlot.Options = {
+ *   width: 800,
+ *   height: 400,
+ *   series: [{}, { label: 'value' }],
+ *   axes: [{ splits: splitsWithLimit(splitsForTime({ granularity: 'day' }), 12) }, {}]
+ * };
+ * ```
+ */
+export function splitsWithLimit(inner: SplitsFn, max: number): SplitsFn {
+	return inheritDomain((self, axisIdx, scaleMin, scaleMax, foundIncr, foundSpace) => {
+		const ticks = inner(self, axisIdx, scaleMin, scaleMax, foundIncr, foundSpace);
+		// A max derived from a measurement can be NaN before first layout (a zero label width
+		// divides into one) or Infinity; neither means "show nothing", so the ticks pass
+		// through unthinned rather than blanking the axis. -Infinity is not in that company:
+		// it orders below every real limit, so it falls through to the max <= 0 case.
+		if (Number.isNaN(max) || max === Infinity) {
+			return ticks;
+		}
+		if (max <= 0) {
+			return [];
+		}
+		if (ticks.length <= max) {
+			return ticks;
+		}
+		const stride = Math.ceil(ticks.length / max);
+		return ticks.filter((_, index) => index % stride === 0);
+	}, inner);
+}
+
+/**
+ * Wraps a `SplitsFn`, keeping only the ticks for which `keep` returns `true` — e.g. hiding
+ * weekend ticks on a daily time axis, or ticks outside business hours.
+ *
+ * Distinct from uPlot's own `axis.filter` option: that one only hides tick *labels* (the
+ * splits remain, so their gridlines and tick marks still render), while dropping a tick here
+ * removes it entirely — label, gridline, and tick mark.
+ *
+ * @example
+ * ```ts
+ * import uPlot from 'uplot';
+ * import { splitsWithFilter, splitsForTime } from 'uplot-kit';
+ *
+ * const isWeekday = (value: number) => {
+ *   const day = new Date(value * 1000).getUTCDay();
+ *   return day !== 0 && day !== 6;
+ * };
+ *
+ * const opts: uPlot.Options = {
+ *   width: 800,
+ *   height: 400,
+ *   series: [{}, { label: 'value' }],
+ *   axes: [{ splits: splitsWithFilter(splitsForTime({ granularity: 'day' }), isWeekday) }, {}]
+ * };
+ * ```
+ */
+export function splitsWithFilter(
+	inner: SplitsFn,
+	keep: (value: number, self: uPlot, axisIdx: number) => boolean
+): SplitsFn {
+	return inheritDomain(
+		(self, axisIdx, scaleMin, scaleMax, foundIncr, foundSpace) =>
+			inner(self, axisIdx, scaleMin, scaleMax, foundIncr, foundSpace).filter((value) =>
+				keep(value, self, axisIdx)
+			),
+		inner
+	);
+}
+
+export interface SplitsWithEdgesOptions {
+	/**
+	 * `'whenEmpty'` adds the edges only as a fallback when the inner function returns no
+	 * ticks at all — e.g. an intraday zoom under {@link splitsForTime}, where no calendar
+	 * boundary falls inside the range. `'always'` appends both edges unconditionally,
+	 * merged with the inner function's own ticks (deduplicated, so an edge that's already a
+	 * real tick isn't doubled).
+	 * @default 'whenEmpty'
+	 */
+	mode?: 'always' | 'whenEmpty';
+}
+
+/**
+ * Wraps a `SplitsFn` so the visible range's edges (`scaleMin`, `scaleMax`) are included in
+ * its output, guarding against an axis left blank because no "real" tick fell inside a
+ * narrow zoom. This is the only place that fallback lives: the generators emit real ticks
+ * and nothing else, so any of them (`splitsForTime`, `splitsForLog`, `splitsForStep`, a
+ * custom one) opts in through this decorator rather than baking the behavior in.
+ *
+ * The edges come from the inner function's {@link SplitsFn.domain} when it declares one —
+ * `splitsWithEdges(splitsForCategory({ count }))` falls back to the first and last real
+ * category, not to the padding uPlot puts around an ordinal scale.
+ *
+ * @example
+ * ```ts
+ * import uPlot from 'uplot';
+ * import { splitsWithEdges, splitsForTime } from 'uplot-kit';
+ *
+ * const opts: uPlot.Options = {
+ *   width: 800,
+ *   height: 400,
+ *   series: [{}, { label: 'value' }],
+ *   // an intraday zoom contains no midnight; show the range edges instead of a blank axis
+ *   axes: [{ splits: splitsWithEdges(splitsForTime({ granularity: 'day' })) }, {}]
+ * };
+ * ```
+ */
+export function splitsWithEdges(inner: SplitsFn, options: SplitsWithEdgesOptions = {}): SplitsFn {
+	const { mode = 'whenEmpty' } = options;
+	return inheritDomain((self, axisIdx, scaleMin, scaleMax, foundIncr, foundSpace) => {
+		const ticks = inner(self, axisIdx, scaleMin, scaleMax, foundIncr, foundSpace);
+		const [lower, upper] = domainOf(inner, scaleMin, scaleMax);
+		if (mode === 'always') {
+			return normalize([...ticks, lower, upper], lower, upper);
+		}
+		return ticks.length > 0 ? ticks : normalize([lower, upper], lower, upper);
+	}, inner);
+}
