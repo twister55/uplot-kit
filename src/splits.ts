@@ -83,6 +83,32 @@ function makeWarnOnce(source: string): (detail: string) => void {
 	};
 }
 
+// Factory-time option check, shared by every generator. The types below are narrow, but a value
+// they forbid still arrives from plain JavaScript or from a config object cast into shape — and
+// the expensive part is never the bad value itself, it is that guessing silently for it yields a
+// plausible-looking axis nobody thinks to distrust (`base: 0` ticking a lone 1, a fractional
+// `weekStartsOn` putting every week tick at midday). Each is named, reported once, and replaced
+// by the documented default, so the chart still renders and the console says why.
+//
+// Checked here rather than per redraw because none of these can change afterwards: the option is
+// closed over, so a per-call test re-answers a settled question on every frame.
+function optionOr<T>(
+	warn: (detail: string) => void,
+	name: string,
+	value: T,
+	isValid: boolean,
+	requirement: string,
+	fallback: T
+): T {
+	if (isValid) {
+		return value;
+	}
+	warn(
+		`${name} must be ${requirement}, got ${JSON.stringify(value)} — falling back to ${JSON.stringify(fallback)}`
+	);
+	return fallback;
+}
+
 const CAP_REACHED = `stopped after ${MAX_TICK_CANDIDATES} tick candidates — the scale range looks degenerate`;
 
 // The one candidate cap every generator shares. `push` reports whether the caller may keep
@@ -140,8 +166,18 @@ function withDomain(splits: SplitsFn, domain: SplitsDomainFn): SplitsFn {
 
 // The range a decorator may inject ticks into: the inner function's own domain when it
 // declares one, the raw scale range otherwise.
+//
+// Intersected with the visible range rather than trusted outright. A domain is documented as a
+// sub-range of [scaleMin, scaleMax], but nothing enforces that on a custom SplitsFn, and the
+// natural way to get it wrong is to compute the domain from the data extent instead of from the
+// arguments — which then survives every pan and zoom and injects ticks off-screen.
 function domainOf(inner: SplitsFn, scaleMin: number, scaleMax: number): [number, number] {
-	return inner.domain?.(scaleMin, scaleMax) ?? [scaleMin, scaleMax];
+	const domain = inner.domain?.(scaleMin, scaleMax);
+	if (domain === undefined) {
+		return [scaleMin, scaleMax];
+	}
+	const [lower, upper] = domain;
+	return [Math.max(lower, scaleMin), Math.min(upper, scaleMax)];
 }
 
 // Decorators re-publish their inner function's domain so a chain of them keeps the narrowing
@@ -178,6 +214,21 @@ function roundTo(value: number, digits: number): number {
 	}
 	const factor = 10 ** digits;
 	return Math.round(value * factor) / factor;
+}
+
+// A double carries just under 16 significant decimal digits, so re-reading a value at 15 drops
+// the last digit — which is exactly where a product's representation error lives — and leaves
+// every value that was exact at that width untouched.
+const SIGNIFICANT_DIGITS = 15;
+
+// Rounds to significant precision rather than to a fixed number of decimal places, which is what
+// a log axis needs: its ticks span every magnitude at once, so decimals are the wrong unit
+// entirely. roundTo() can only see that 3e23 has no fractional part and leaves
+// 2.9999999999999997e+23 as it found it, and at the other end it refuses to act at all once a
+// value needs more than 15 decimals, leaving 6.999999999999999e-16 for the label formatter.
+// Significant digits are scale-free and clean both ends with one rule.
+function roundSignificant(value: number): number {
+	return Number.isFinite(value) ? Number(value.toPrecision(SIGNIFICANT_DIGITS)) : value;
 }
 
 // The arithmetic tick grid `anchor + k * step`, clamped to [lower, upper] — the shared body of
@@ -378,6 +429,9 @@ const DEFAULT_GRANULARITY: SplitsForTimeGranularity = 'day';
 // Unix seconds, matching uPlot's own default for the option this mirrors.
 const DEFAULT_MS = 1e-3;
 
+// Decimal decades, matching uPlot's own default `log`.
+const DEFAULT_BASE = 10;
+
 const SPLIT_LEVELS: SplitLevel[] = [
 	{
 		granularity: 'day',
@@ -489,29 +543,44 @@ export interface SplitsForTimeOptions {
  */
 export function splitsForTime(options: SplitsForTimeOptions = {}): SplitsFn {
 	const {
-		granularity = DEFAULT_GRANULARITY,
-		ms = DEFAULT_MS,
+		granularity: rawGranularity = DEFAULT_GRANULARITY,
+		ms: rawMs = DEFAULT_MS,
 		offsetSec = 0,
-		weekStartsOn = 0
+		weekStartsOn: rawWeekStartsOn = 0
 	} = options;
-	const ctx: SplitContext = { offsetSec, weekStartsOn };
 	const warn = makeWarnOnce('splitsForTime');
 
-	// A granularity outside the union can only arrive from a JS caller or a config string, and
-	// unlike a non-positive `step` it has no "nothing to tick" reading — so picking a rung for it
-	// is a guess, not a degenerate answer. Left silent, the guess was the *finest* rung, which is
-	// the opposite of what a caller asking for a coarse granularity wanted: a typo like 'Month'
-	// quietly restored the intra-bucket ticks the option exists to suppress. Say so once, at
-	// factory time, and behave as if the option had been omitted. Warning rather than throwing
-	// because this reaches production through data-driven config, where a stale enum value should
-	// cost a denser axis, not the whole chart.
-	const startIdx = SPLIT_LEVELS.findIndex((level) => level.granularity === granularity);
-	if (startIdx < 0) {
-		warn(
-			`unknown granularity ${JSON.stringify(granularity)} — falling back to '${DEFAULT_GRANULARITY}'`
-		);
-	}
-	const levels = SPLIT_LEVELS.slice(startIdx < 0 ? 0 : startIdx);
+	// A granularity outside the union has no "nothing to tick" reading the way a non-positive
+	// step does, so picking a rung for it is a guess rather than a degenerate answer. Left
+	// silent, the guess was the *finest* rung — the opposite of what a caller asking for a
+	// coarse granularity wanted, so a typo like 'Month' quietly restored the intra-bucket ticks
+	// the option exists to suppress.
+	const granularity = optionOr(
+		warn,
+		'granularity',
+		rawGranularity,
+		SPLIT_LEVELS.some((level) => level.granularity === rawGranularity),
+		`one of ${SPLIT_LEVELS.map((level) => `'${level.granularity}'`).join(', ')}`,
+		DEFAULT_GRANULARITY
+	);
+	// DEFAULT_GRANULARITY is the ladder's first entry, so the fallback keeps every rung.
+	const levels = SPLIT_LEVELS.slice(
+		SPLIT_LEVELS.findIndex((level) => level.granularity === granularity)
+	);
+
+	// Sunday-relative day index, so anything but a whole 0..6 describes no week start at all —
+	// and a fractional one is the dangerous shape, since it shifts every tick by a fraction of a
+	// day and produces a plausible-looking axis of Monday-at-noon boundaries.
+	const weekStartsOn = optionOr(
+		warn,
+		'weekStartsOn',
+		rawWeekStartsOn,
+		Number.isInteger(rawWeekStartsOn) && rawWeekStartsOn >= 0 && rawWeekStartsOn <= 6,
+		'a whole number from 0 (Sunday) to 6 (Saturday)',
+		0
+	);
+	const ctx: SplitContext = { offsetSec, weekStartsOn };
+
 	// Axis units per second, derived the same way uPlot derives its own: it reads a timestamp
 	// as `new Date(value / ms)` milliseconds, so a second is `1000 * ms` axis units — exactly
 	// 1 for the seconds default (`1000 * 1e-3` is exact) and 1000 for a millisecond axis.
@@ -522,13 +591,15 @@ export function splitsForTime(options: SplitsForTimeOptions = {}): SplitsFn {
 	// into NaN and every tick into nonsense. What is checked is the arithmetic, not uPlot's
 	// two-value enum: any finite positive unit keeps the math well-defined, so a caller ahead
 	// of uPlot on units is not blocked for the sake of it.
-	let unitsPerSec = 1000 * ms;
-	if (!Number.isFinite(unitsPerSec) || unitsPerSec <= 0) {
-		warn(
-			`ms must be finite and positive, got ${JSON.stringify(ms)} — falling back to ${DEFAULT_MS}`
-		);
-		unitsPerSec = 1000 * DEFAULT_MS;
-	}
+	const ms = optionOr(
+		warn,
+		'ms',
+		rawMs,
+		Number.isFinite(rawMs) && rawMs > 0,
+		'finite and positive',
+		DEFAULT_MS
+	);
+	const unitsPerSec = 1000 * ms;
 
 	return (_self, _axisIdx, scaleMin, scaleMax) => {
 		if (!isTickable(scaleMin, scaleMax)) {
@@ -580,7 +651,9 @@ export interface SplitsForLogOptions {
 	minor?: boolean;
 	/**
 	 * Mantissas multiplied onto each decade to produce interior ticks when `minor` is
-	 * set — e.g. `[2, 5]` for a sparser 1-2-5 minor grid instead of every integer.
+	 * set — e.g. `[2, 5]` for a sparser 1-2-5 minor grid instead of every integer. Fractional
+	 * values are placed exactly, which `base: 2` requires: no integer lies between 1 and 2.
+	 * The array is copied once, so mutating it afterwards leaves a built axis alone.
 	 * @default `[2, 3, 4, 5, 6, 7, 8, 9]` for `base: 10`; `[]` (no interior ticks) for `base: 2`
 	 */
 	minorMantissas?: number[];
@@ -628,11 +701,27 @@ export interface SplitsForLogOptions {
  */
 export function splitsForLog(options: SplitsForLogOptions = {}): SplitsFn {
 	const {
-		base = 10,
+		base: rawBase = DEFAULT_BASE,
 		minor = false,
-		minorMantissas = base === 10 ? [2, 3, 4, 5, 6, 7, 8, 9] : []
+		minorMantissas = rawBase === 10 ? [2, 3, 4, 5, 6, 7, 8, 9] : []
 	} = options;
 	const warn = makeWarnOnce('splitsForLog');
+	// What is rejected is arithmetic nonsense, not uPlot's `10 | 2`: a base of 1 makes the decade
+	// walk divide by log(1) === 0, and 0 or Infinity make `base ** power` collapse to a single
+	// bogus tick at 1. A base the type forbids but the sweep handles (3, say) is left alone —
+	// it produces a correct base-3 grid, which is at worst mismatched with the scale's own
+	// transform, and that is visible at a glance rather than silent.
+	const base = optionOr(
+		warn,
+		'base',
+		rawBase,
+		Number.isFinite(rawBase) && rawBase > 1,
+		'a finite number greater than 1',
+		DEFAULT_BASE
+	);
+	// Copied, because the array is read on every redraw but supplied once: without this, a caller
+	// who keeps their own reference and mutates it later silently rewrites an already-built axis.
+	const mantissas = [...minorMantissas];
 
 	return (_self, _axisIdx, scaleMin, scaleMax) => {
 		if (!isTickable(scaleMin, scaleMax) || scaleMin <= 0) {
@@ -648,17 +737,14 @@ export function splitsForLog(options: SplitsForLogOptions = {}): SplitsFn {
 			const decade = base ** power;
 			const values = [decade];
 			if (minor) {
-				// A mantissa scaled into a sub-1 decade is inexact (9 * 0.001 is
-				// 0.009000000000000001), so each interior tick is rounded back to the precision
-				// its own two factors carry: the decade's digits plus the mantissa's. Rounding to
-				// the decade's alone would snap a fractional mantissa onto the decade's grid —
-				// 1.5 * 0.5 would tick at 0.8 rather than 0.75 — and fractional mantissas are not
-				// a corner case: base 2 has no integer mantissa to offer, since none exists
-				// between 1 and 2. Computed inside this branch so the default (major-only) redraw
-				// path never pays for the string-formatting behind fractionDigits.
-				const decadeDigits = fractionDigits(decade);
-				for (const mantissa of minorMantissas) {
-					values.push(roundTo(mantissa * decade, decadeDigits + fractionDigits(mantissa)));
+				// Scaling a mantissa into a decade is inexact at both ends of the range — 9 * 0.001
+				// is 0.009000000000000001, 3 * 1e23 is 2.9999999999999997e+23 — and the error is
+				// always in the last significant digit, never at a fixed decimal place. Rounding by
+				// significant digits therefore fixes every decade with one rule, including the two
+				// bands where counting decimals cannot help at all: past 1e15 there are no decimals
+				// left to round to, and below 1e-15 there are more than a double can carry.
+				for (const mantissa of mantissas) {
+					values.push(roundSignificant(mantissa * decade));
 				}
 			}
 			if (!collector.pushAll(values)) {
@@ -725,13 +811,23 @@ export interface SplitsForStepOptions {
 export function splitsForStep(options: SplitsForStepOptions): SplitsFn {
 	const { step, anchor = 0 } = options;
 	const warn = makeWarnOnce('splitsForStep');
+
+	// The one option here with no default to fall back to — a grid without a spacing is not a
+	// grid — so an unusable step gives a function that ticks nothing, said once, rather than a
+	// guess. A blank axis with no explanation is the most expensive failure in this file to
+	// track down, and it was the one a plain `step: 0` used to produce.
+	if (!(Number.isFinite(step) && step > 0)) {
+		warn(`step must be a finite number greater than zero, got ${JSON.stringify(step)} — no ticks`);
+		return () => [];
+	}
+
 	// A tick is only ever as precise as the two numbers that define the grid, so rounding to
 	// whichever of them carries more decimals removes float noise without moving a tick the
 	// caller could have written down themselves.
 	const digits = Math.max(fractionDigits(step), fractionDigits(anchor));
 
 	return (_self, _axisIdx, scaleMin, scaleMax) => {
-		if (!isTickable(scaleMin, scaleMax) || !(step > 0)) {
+		if (!isTickable(scaleMin, scaleMax)) {
 			return [];
 		}
 
@@ -746,16 +842,18 @@ export function splitsForStep(options: SplitsForStepOptions): SplitsFn {
 export interface SplitsForCategoryOptions {
 	/**
 	 * Total number of categories on the axis. When set, ticks are clamped to the valid
-	 * index range `[0, count - 1]` — uPlot pads an ordinal scale (`distr: 2`) like any
-	 * other, and the padded region past the last category has no real value to tick on.
+	 * index range `[0, count - 1]`, so a scale wider than the data — an explicit
+	 * `scales.x.range`, or an ordinal y scale, which uPlot does pad — gets no ticks in the
+	 * region past the last category. A value that is not a whole count warns once and is
+	 * ignored.
 	 * @default undefined — no clamping beyond the visible scale range
 	 */
 	count?: number;
 	/**
 	 * Emit every Nth category index instead of every index, e.g. `2` to label every
-	 * other bar on a dense category axis. Must be a positive integer — category indices
-	 * are whole numbers, so a fractional step has no valid tick to land on and yields no
-	 * ticks at all rather than half-index ones with no category behind them.
+	 * other bar on a dense category axis. Must be a positive whole number — category
+	 * indices are whole numbers, so a fractional step describes no tick that any category
+	 * sits behind; one warns once and falls back to the default.
 	 * @default 1
 	 */
 	step?: number;
@@ -799,11 +897,28 @@ export interface SplitsForCategoryOptions {
  * ```
  */
 export function splitsForCategory(options: SplitsForCategoryOptions = {}): SplitsFn {
-	const { count, step = 1 } = options;
+	const { count: rawCount, step: rawStep = 1 } = options;
 	const warn = makeWarnOnce('splitsForCategory');
 	// Category indices are whole numbers by construction, so a fractional step describes no
 	// reachable tick — and the grid never needs the decimal rounding the other generators do.
-	const usableStep = Number.isInteger(step) && step > 0;
+	const step = optionOr(
+		warn,
+		'step',
+		rawStep,
+		Number.isInteger(rawStep) && rawStep > 0,
+		'a positive whole number of category indices',
+		1
+	);
+	// `count` is a cardinality, so a fractional or non-finite one describes no set of categories.
+	// Unlike the others its fallback is "unset", which is a real setting here — no clamping —
+	// rather than a substitute value, so it does not go through optionOr.
+	let count = rawCount;
+	if (count !== undefined && !(Number.isInteger(count) && count >= 0)) {
+		warn(
+			`count must be a whole number of categories, got ${JSON.stringify(count)} — ignoring it, so ticks are clamped to the visible range only`
+		);
+		count = undefined;
+	}
 
 	// Published as this function's domain (see SplitsDomainFn) so a decorator wrapped around
 	// it — splitsWithEdges in particular — injects its own ticks into the real category range
@@ -814,10 +929,6 @@ export function splitsForCategory(options: SplitsForCategoryOptions = {}): Split
 			: [Math.max(scaleMin, 0), Math.min(scaleMax, count - 1)];
 
 	return withDomain((_self, _axisIdx, scaleMin, scaleMax) => {
-		if (!usableStep) {
-			return [];
-		}
-
 		const [lowerBound, upperBound] = domain(scaleMin, scaleMax);
 		if (!isTickable(lowerBound, upperBound)) {
 			return [];
@@ -832,10 +943,14 @@ export function splitsForCategory(options: SplitsForCategoryOptions = {}): Split
 
 /**
  * Wraps a `SplitsFn` so its output always includes the given values — e.g. a zero baseline
- * or an alert threshold — in addition to whatever the inner function ticks. The merged tick
- * set is deduplicated, sorted, and clamped back to the visible range, same as any generator's
- * own output: a value outside the current range is dropped rather than extending the axis, so
- * pin the scale (`scales.y.range`) if a threshold must stay visible while the user zooms.
+ * or an alert threshold — in addition to whatever the inner function ticks. The result is
+ * deduplicated and sorted, and the injected values are clamped to the visible range: one outside
+ * it is dropped rather than extending the axis, so pin the scale (`scales.y.range`) if a
+ * threshold must stay visible while the user zooms. The inner function's own ticks are passed
+ * through as it emitted them.
+ *
+ * `values` is read on every redraw but copied once, so mutating the array afterwards does not
+ * change an axis already built from it.
  *
  * When the inner function declares a narrower {@link SplitsFn.domain} (as
  * {@link splitsForCategory} does with `count`), values are clamped to that instead of the raw
@@ -865,11 +980,14 @@ export function splitsForCategory(options: SplitsForCategoryOptions = {}): Split
  * ```
  */
 export function splitsWithInclude(inner: SplitsFn, values: number[]): SplitsFn {
+	// Copied for the same reason splitsForLog copies its mantissas: read every redraw, supplied
+	// once, so a caller's later mutation must not reach back into a built axis.
+	const injected = [...values];
 	return inheritDomain((self, axisIdx, scaleMin, scaleMax, foundIncr, foundSpace) => {
 		const [lower, upper] = domainOf(inner, scaleMin, scaleMax);
 		return mergeTicks(
 			inner(self, axisIdx, scaleMin, scaleMax, foundIncr, foundSpace),
-			values,
+			injected,
 			lower,
 			upper
 		);

@@ -10,6 +10,7 @@ import {
 	splitsWithFilter,
 	splitsWithInclude,
 	splitsWithLimit,
+	type SplitsFn,
 	type SplitsForTimeGranularity
 } from './splits';
 
@@ -105,11 +106,47 @@ describe('splitsForTime', () => {
 				splitsForTime({ granularity: 'day' })(fakeSelf(), 0, scaleMin, scaleMax, 0, 0)
 			);
 			expect(warn).toHaveBeenCalledOnce();
-			expect(warn.mock.calls[0]?.[0]).toContain('unknown granularity "Month"');
+			expect(warn.mock.calls[0]?.[0]).toContain('granularity must be one of');
+			expect(warn.mock.calls[0]?.[0]).toContain('"Month"');
 
 			// diagnosed at factory time, so redraws stay quiet
 			splits(fakeSelf(), 0, scaleMin, scaleMax, 0, 0);
 			expect(warn).toHaveBeenCalledOnce();
+		} finally {
+			warn.mockRestore();
+		}
+	});
+
+	it('warns and falls back to Sunday for a weekStartsOn that is not a whole day', () => {
+		const warn = vi.spyOn(console, 'warn').mockImplementation(() => {});
+		try {
+			const scaleMin = unixSec('2026-01-01T00:00:00Z');
+			const scaleMax = unixSec('2026-01-31T00:00:00Z');
+			const sundays = splitsForTime({ granularity: 'week' })(
+				fakeSelf(),
+				0,
+				scaleMin,
+				scaleMax,
+				0,
+				0
+			);
+
+			// 1.5 is the dangerous one: it used to shift every tick half a day and produce a
+			// plausible-looking axis of Monday-at-noon "week starts"
+			for (const weekStartsOn of [1.5, 7, -1, NaN]) {
+				expect(
+					splitsForTime({ granularity: 'week', weekStartsOn: weekStartsOn as 0 })(
+						fakeSelf(),
+						0,
+						scaleMin,
+						scaleMax,
+						0,
+						0
+					)
+				).toEqual(sundays);
+			}
+			expect(warn).toHaveBeenCalledTimes(4);
+			expect(warn.mock.calls[0]?.[0]).toContain('weekStartsOn must be a whole number');
 		} finally {
 			warn.mockRestore();
 		}
@@ -516,6 +553,56 @@ describe('splitsForLog', () => {
 		expect(result).toEqual([0.001, 0.002, 0.003, 0.004, 0.005, 0.006, 0.007, 0.008, 0.009, 0.01]);
 	});
 
+	it('places minor ticks exactly at magnitudes where decimal places cannot help', () => {
+		// past 1e15 a double has no decimals left to round to, and below 1e-15 it has more than
+		// it can carry — both bands defeat decimal rounding, and the error lands in the last
+		// significant digit either way
+		const splits = splitsForLog({ minor: true });
+
+		expect(splits(fakeSelf(), 0, 1e23, 1e24, 0, 0)).toEqual([
+			1e23, 2e23, 3e23, 4e23, 5e23, 6e23, 7e23, 8e23, 9e23, 1e24
+		]);
+		expect(splits(fakeSelf(), 0, 1e-16, 1e-15, 0, 0)).toEqual([
+			1e-16, 2e-16, 3e-16, 4e-16, 5e-16, 6e-16, 7e-16, 8e-16, 9e-16, 1e-15
+		]);
+	});
+
+	it('warns and falls back to base 10 for a base the decade walk cannot use', () => {
+		const warn = vi.spyOn(console, 'warn').mockImplementation(() => {});
+		try {
+			// base 1 divides by log(1) === 0; base 0 and Infinity collapse `base ** power` onto a
+			// single bogus tick at 1 — all three used to return that or [] with no explanation
+			const decades = [1, 10, 100, 1000];
+			for (const base of [1, 0, -10, Infinity, NaN]) {
+				expect(splitsForLog({ base: base as 10 })(fakeSelf(), 0, 1, 1000, 0, 0)).toEqual(decades);
+			}
+			expect(warn).toHaveBeenCalledTimes(5); // one per factory
+			expect(warn.mock.calls[0]?.[0]).toContain('base must be a finite number greater than 1');
+
+			// a base the type forbids but the sweep handles is left alone — it is a correct
+			// base-3 grid, not nonsense
+			warn.mockClear();
+			expect(splitsForLog({ base: 3 as 10 })(fakeSelf(), 0, 1, 100, 0, 0)).toEqual([
+				1, 3, 9, 27, 81
+			]);
+			expect(warn).not.toHaveBeenCalled();
+		} finally {
+			warn.mockRestore();
+		}
+	});
+
+	it('does not let a caller mutate minorMantissas after the fact', () => {
+		const mantissas = [5];
+		const splits = splitsForLog({ minor: true, minorMantissas: mantissas });
+
+		expect(splits(fakeSelf(), 0, 1, 10, 0, 0)).toEqual([1, 5, 10]);
+
+		mantissas.push(2, 3);
+		mantissas[0] = 9;
+
+		expect(splits(fakeSelf(), 0, 1, 10, 0, 0)).toEqual([1, 5, 10]);
+	});
+
 	it('caps the decade walk on an absurd range instead of allocating unbounded', () => {
 		const warn = vi.spyOn(console, 'warn').mockImplementation(() => {});
 		try {
@@ -560,10 +647,20 @@ describe('splitsForStep', () => {
 		}
 	});
 
-	it('returns an empty array for a non-positive step', () => {
-		const splits = splitsForStep({ step: 0 });
-
-		expect(splits(fakeSelf(), 0, 0, 100, 0, 0)).toEqual([]);
+	it('says so once and ticks nothing for an unusable step', () => {
+		const warn = vi.spyOn(console, 'warn').mockImplementation(() => {});
+		try {
+			// `step` is the one option with no default to fall back to, so this is the only
+			// generator whose bad-option answer is a blank axis — which is exactly why it has to
+			// say why, once, instead of leaving a silent empty axis to be tracked down
+			for (const step of [0, -10, NaN, Infinity]) {
+				expect(splitsForStep({ step })(fakeSelf(), 0, 0, 100, 0, 0)).toEqual([]);
+			}
+			expect(warn).toHaveBeenCalledTimes(4); // one per factory
+			expect(warn.mock.calls[0]?.[0]).toContain('step must be a finite number greater than zero');
+		} finally {
+			warn.mockRestore();
+		}
 	});
 
 	it('returns a single tick for equal bounds and nothing degenerate for bad bounds', () => {
@@ -742,6 +839,35 @@ describe('splitsWithInclude', () => {
 		expect(result).toEqual([0, 10, 20, 30]);
 	});
 
+	it('clamps injected values to the visible range even when the domain is wider', () => {
+		// a domain computed from the data extent rather than from the arguments survives every
+		// pan and zoom; without intersecting it with the visible range the injected values ride
+		// along off-screen
+		const inner: SplitsFn = Object.assign(
+			(_self: uPlot, _axisIdx: number, min: number, max: number): number[] =>
+				[0, 25, 50, 75, 100].filter((value) => value >= min && value <= max),
+			{ domain: (): [number, number] => [0, 100] }
+		);
+
+		expect(splitsWithInclude(inner, [0, 50, 100])(fakeSelf(), 0, 40, 60, 0, 0)).toEqual([50]);
+		expect(splitsWithEdges(inner, { mode: 'always' })(fakeSelf(), 0, 40, 60, 0, 0)).toEqual([
+			40, 50, 60
+		]);
+	});
+
+	it('does not let a caller mutate the injected values after the fact', () => {
+		const thresholds = [25];
+		const wrapped = splitsWithInclude(splitsForStep({ step: 10 }), thresholds);
+
+		expect(wrapped(fakeSelf(), 0, 0, 30, 0, 0)).toEqual([0, 10, 20, 25, 30]);
+
+		thresholds.length = 0;
+		thresholds.push(5, 15);
+
+		// the array is read every redraw but copied once, so an axis already built is untouched
+		expect(wrapped(fakeSelf(), 0, 0, 30, 0, 0)).toEqual([0, 10, 20, 25, 30]);
+	});
+
 	it('clamps injected values to the inner domain, not just the raw range', () => {
 		const wrapped = splitsWithInclude(splitsForCategory({ count: 5 }), [-0.5, 4, 5.5]);
 
@@ -884,17 +1010,40 @@ describe('splitsForCategory', () => {
 		expect(splits(fakeSelf(), 0, 10, 20, 0, 0)).toEqual([]);
 	});
 
-	it('returns an empty array for a non-positive step', () => {
-		const splits = splitsForCategory({ step: 0 });
-
-		expect(splits(fakeSelf(), 0, 0, 10, 0, 0)).toEqual([]);
+	it('warns and falls back to every index for a step that is not a whole count', () => {
+		const warn = vi.spyOn(console, 'warn').mockImplementation(() => {});
+		try {
+			// a half index has no category behind it, so it must never be ticked — but unlike
+			// splitsForStep this option has a default to fall back to, and a dense readable axis
+			// beats a blank one once the console says what happened
+			expect(splitsForCategory({ step: 0.5 })(fakeSelf(), 0, 0, 4, 0, 0)).toEqual([0, 1, 2, 3, 4]);
+			expect(splitsForCategory({ step: 0 })(fakeSelf(), 0, 0, 3, 0, 0)).toEqual([0, 1, 2, 3]);
+			expect(warn).toHaveBeenCalledTimes(2);
+			expect(warn.mock.calls[0]?.[0]).toContain('step must be a positive whole number');
+		} finally {
+			warn.mockRestore();
+		}
 	});
 
-	it('returns an empty array for a fractional step rather than half-index ticks', () => {
-		// a half index has no category behind it, so `values: (_u, t) => t.map(i => cats[i])`
-		// would render a gridline with a blank label
-		expect(splitsForCategory({ step: 0.5 })(fakeSelf(), 0, 0, 4, 0, 0)).toEqual([]);
-		expect(splitsForCategory({ step: 1.5, count: 9 })(fakeSelf(), 0, 0, 8, 0, 0)).toEqual([]);
+	it('warns and ignores a count that is not a whole number of categories', () => {
+		const warn = vi.spyOn(console, 'warn').mockImplementation(() => {});
+		try {
+			// falling back to "unset" means no clamping — the documented default — rather than
+			// clamping to a fractional index, which silently dropped the last category
+			expect(splitsForCategory({ count: 2.5 })(fakeSelf(), 0, 0, 4, 0, 0)).toEqual([0, 1, 2, 3, 4]);
+			expect(splitsForCategory({ count: Infinity })(fakeSelf(), 0, 0, 3, 0, 0)).toEqual([
+				0, 1, 2, 3
+			]);
+			expect(warn).toHaveBeenCalledTimes(2);
+			expect(warn.mock.calls[0]?.[0]).toContain('count must be a whole number of categories');
+
+			// a real count of zero is a legitimate answer, not a bad option: no categories, no ticks
+			warn.mockClear();
+			expect(splitsForCategory({ count: 0 })(fakeSelf(), 0, 0, 4, 0, 0)).toEqual([]);
+			expect(warn).not.toHaveBeenCalled();
+		} finally {
+			warn.mockRestore();
+		}
 	});
 
 	it('returns a single tick for equal bounds and nothing degenerate for bad bounds', () => {
