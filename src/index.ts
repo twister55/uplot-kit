@@ -9,7 +9,6 @@ export {
 	splitsWithFilter,
 	splitsWithInclude,
 	splitsWithLimit,
-	type SplitsDomainFn,
 	type SplitsFn,
 	type SplitsForCategoryOptions,
 	type SplitsForLogOptions,

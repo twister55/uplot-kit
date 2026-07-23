@@ -25,43 +25,26 @@ const MAX_TICK_CANDIDATES = 10_000;
 // axis — while still refusing the cases that are wrong by a third.
 const MAX_GRID_SPACING_ERROR = 1e-3;
 
-/** The `axis.splits` function shape every generator below returns, and every decorator wraps
- * — narrower than uPlot's `Axis.Splits` union (which also allows a static `number[]`), so
- * callers get a directly callable function back instead of having to narrow the union
- * themselves. */
-export interface SplitsFn {
-	(
-		self: uPlot,
-		axisIdx: number,
-		scaleMin: number,
-		scaleMax: number,
-		foundIncr: number,
-		foundSpace: number
-	): number[];
-	/**
-	 * Optional narrowing of the range this function considers tickable at all; see
-	 * {@link SplitsDomainFn}. Set by {@link splitsForCategory} (whose `count` excludes the
-	 * padded region past the last category) and propagated by every decorator; a custom
-	 * `SplitsFn` with a domain narrower than the scale range can set it too.
-	 */
-	domain?: SplitsDomainFn;
-}
-
 /**
- * The sub-range of `[scaleMin, scaleMax]` on which a {@link SplitsFn} considers ticks
- * meaningful, as an inclusive `[lower, upper]` pair. Decorators that inject ticks of their
- * own — {@link splitsWithEdges}, {@link splitsWithInclude} — clamp to it instead of the raw
- * scale range, so wrapping a generator can never re-introduce a tick the generator itself
- * refuses to emit. An inverted or non-finite pair means "nothing here is tickable".
+ * The `axis.splits` function shape every generator below returns, and every decorator wraps —
+ * narrower than uPlot's `Axis.Splits` union (which also allows a static `number[]`), so callers
+ * get a directly callable function back instead of having to narrow the union themselves.
  */
-export type SplitsDomainFn = (scaleMin: number, scaleMax: number) => [number, number];
+export type SplitsFn = (
+	self: uPlot,
+	axisIdx: number,
+	scaleMin: number,
+	scaleMax: number,
+	foundIncr: number,
+	foundSpace: number
+) => number[];
 
 // --- Shared helpers (private) ---
 
 // The part of the degenerate-range guard the generators share: non-finite bounds and an inverted
 // range both mean "nothing sensible to tick". It is only the shared part — each generator adds
-// its own (splitsForLog rejects scaleMin <= 0, splitsForCategory tests the clamped domain rather
-// than the raw range), so this is a predicate to build on, not the whole policy.
+// its own (splitsForLog rejects scaleMin <= 0, splitsForCategory tests the count-clamped range
+// rather than the raw one), so this is a predicate to build on, not the whole policy.
 //
 // A zero-width range — the one case uPlot itself passes through unpadded (single-point data)
 // — is deliberately *not* special-cased. Letting it flow through the generator's own grid means
@@ -139,34 +122,6 @@ function makeCollector(warn: (detail: string) => void): TickCollector {
 		return true;
 	};
 	return { values, push, warn };
-}
-
-// Attaches a domain to a freshly built SplitsFn; see SplitsDomainFn.
-function withDomain(splits: SplitsFn, domain: SplitsDomainFn): SplitsFn {
-	splits.domain = domain;
-	return splits;
-}
-
-// The range a decorator may inject ticks into: the inner function's own domain when it
-// declares one, the raw scale range otherwise.
-//
-// Intersected with the visible range rather than trusted outright. A domain is documented as a
-// sub-range of [scaleMin, scaleMax], but nothing enforces that on a custom SplitsFn, and the
-// natural way to get it wrong is to compute the domain from the data extent instead of from the
-// arguments — which then survives every pan and zoom and injects ticks off-screen.
-function domainOf(inner: SplitsFn, scaleMin: number, scaleMax: number): [number, number] {
-	const domain = inner.domain?.(scaleMin, scaleMax);
-	if (domain === undefined) {
-		return [scaleMin, scaleMax];
-	}
-	const [lower, upper] = domain;
-	return [Math.max(lower, scaleMin), Math.min(upper, scaleMax)];
-}
-
-// Decorators re-publish their inner function's domain so a chain of them keeps the narrowing
-// instead of dropping it at the first wrap.
-function inheritDomain(wrapped: SplitsFn, inner: SplitsFn): SplitsFn {
-	return inner.domain === undefined ? wrapped : withDomain(wrapped, inner.domain);
 }
 
 // Number of digits after the decimal point in `value`'s own shortest decimal form, used to
@@ -981,23 +936,20 @@ export function splitsForCategory(options: SplitsForCategoryOptions = {}): Split
 		count = undefined;
 	}
 
-	// Published as this function's domain (see SplitsDomainFn) so a decorator wrapped around
-	// it — splitsWithEdges in particular — injects its own ticks into the real category range
-	// rather than back into the padding `count` exists to exclude.
-	const domain: SplitsDomainFn = (scaleMin, scaleMax) =>
-		count === undefined
-			? [scaleMin, scaleMax]
-			: [Math.max(scaleMin, 0), Math.min(scaleMax, count - 1)];
-
-	return withDomain((_self, _axisIdx, scaleMin, scaleMax) => {
-		const [lowerBound, upperBound] = domain(scaleMin, scaleMax);
+	return (_self, _axisIdx, scaleMin, scaleMax) => {
+		// `count` clamps the tick range to the real category indices. uPlot does not pad an
+		// ordinal x scale, so by default scaleMin/scaleMax are already [0, count - 1] and this is
+		// a no-op; it earns its keep only where the scale is wider than the data — an explicit
+		// `scales.x.range`, or an ordinal y scale, which uPlot does pad.
+		const lowerBound = count === undefined ? scaleMin : Math.max(scaleMin, 0);
+		const upperBound = count === undefined ? scaleMax : Math.min(scaleMax, count - 1);
 		if (!isTickable(lowerBound, upperBound)) {
 			return [];
 		}
 
 		// Category indices are the zero-anchored case of splitsForStep's own grid.
 		return stepGrid(0, step, 0, lowerBound, upperBound, makeCollector(warn));
-	}, domain);
+	};
 }
 
 // --- Decorators (SplitsFn => SplitsFn) ---
@@ -1012,10 +964,6 @@ export function splitsForCategory(options: SplitsForCategoryOptions = {}): Split
  *
  * `values` is read on every redraw but copied once, so mutating the array afterwards does not
  * change an axis already built from it.
- *
- * When the inner function declares a narrower {@link SplitsFn.domain} (as
- * {@link splitsForCategory} does with `count`), values are clamped to that instead of the raw
- * range, so wrapping can't re-introduce a tick the generator itself refuses to emit.
  *
  * @example
  * ```ts
@@ -1044,15 +992,13 @@ export function splitsWithInclude(inner: SplitsFn, values: number[]): SplitsFn {
 	// Copied for the same reason splitsForLog copies its mantissas: read every redraw, supplied
 	// once, so a caller's later mutation must not reach back into a built axis.
 	const injected = [...values];
-	return inheritDomain((self, axisIdx, scaleMin, scaleMax, foundIncr, foundSpace) => {
-		const [lower, upper] = domainOf(inner, scaleMin, scaleMax);
-		return mergeTicks(
+	return (self, axisIdx, scaleMin, scaleMax, foundIncr, foundSpace) =>
+		mergeTicks(
 			inner(self, axisIdx, scaleMin, scaleMax, foundIncr, foundSpace),
 			injected,
-			lower,
-			upper
+			scaleMin,
+			scaleMax
 		);
-	}, inner);
 }
 
 /**
@@ -1093,7 +1039,7 @@ export function splitsWithInclude(inner: SplitsFn, values: number[]): SplitsFn {
  * ```
  */
 export function splitsWithLimit(inner: SplitsFn, max: number): SplitsFn {
-	return inheritDomain((self, axisIdx, scaleMin, scaleMax, foundIncr, foundSpace) => {
+	return (self, axisIdx, scaleMin, scaleMax, foundIncr, foundSpace) => {
 		const ticks = inner(self, axisIdx, scaleMin, scaleMax, foundIncr, foundSpace);
 		// "Not measured yet" is not "show nothing", so an unusable `max` passes the ticks
 		// through unthinned rather than blanking the axis. It arrives spelled three ways: `NaN`
@@ -1117,7 +1063,7 @@ export function splitsWithLimit(inner: SplitsFn, max: number): SplitsFn {
 		}
 		const stride = Math.ceil(ticks.length / limit);
 		return ticks.filter((_, index) => index % stride === 0);
-	}, inner);
+	};
 }
 
 /**
@@ -1127,6 +1073,12 @@ export function splitsWithLimit(inner: SplitsFn, max: number): SplitsFn {
  * Distinct from uPlot's own `axis.filter` option: that one only hides tick *labels* (the
  * splits remain, so their gridlines and tick marks still render), while dropping a tick here
  * removes it entirely — label, gridline, and tick mark.
+ *
+ * Wrap this *outside* {@link splitsWithEdges}, not inside it —
+ * `splitsWithEdges(splitsWithFilter(inner, keep))` re-adds the range edges without passing
+ * them through `keep`, so on a window the filter empties (a weekend-only zoom, say) the
+ * fallback puts back exactly the ticks the filter removed. Wrapping the other way,
+ * `splitsWithFilter(splitsWithEdges(inner), keep)`, filters the edges too.
  *
  * @example
  * ```ts
@@ -1159,13 +1111,10 @@ export function splitsWithFilter(
 	inner: SplitsFn,
 	keep: (value: number, self: uPlot, axisIdx: number) => boolean
 ): SplitsFn {
-	return inheritDomain(
-		(self, axisIdx, scaleMin, scaleMax, foundIncr, foundSpace) =>
-			inner(self, axisIdx, scaleMin, scaleMax, foundIncr, foundSpace).filter((value) =>
-				keep(value, self, axisIdx)
-			),
-		inner
-	);
+	return (self, axisIdx, scaleMin, scaleMax, foundIncr, foundSpace) =>
+		inner(self, axisIdx, scaleMin, scaleMax, foundIncr, foundSpace).filter((value) =>
+			keep(value, self, axisIdx)
+		);
 }
 
 export interface SplitsWithEdgesOptions {
@@ -1187,9 +1136,9 @@ export interface SplitsWithEdgesOptions {
  * and nothing else, so any of them (`splitsForTime`, `splitsForLog`, `splitsForStep`, a
  * custom one) opts in through this decorator rather than baking the behavior in.
  *
- * The edges come from the inner function's {@link SplitsFn.domain} when it declares one —
- * `splitsWithEdges(splitsForCategory({ count }))` falls back to the first and last real
- * category, not to the padding uPlot puts around an ordinal scale.
+ * The edges are the raw `scaleMin` / `scaleMax`, so wrap this on a `splitsForCategory` axis
+ * only when the scale spans exactly the category indices (uPlot's default ordinal x scale
+ * does) — a scale deliberately wider than the data would put an edge in the padding.
  *
  * @example
  * ```ts
@@ -1216,15 +1165,14 @@ export interface SplitsWithEdgesOptions {
  */
 export function splitsWithEdges(inner: SplitsFn, options: SplitsWithEdgesOptions = {}): SplitsFn {
 	const { mode = 'whenEmpty' } = options;
-	return inheritDomain((self, axisIdx, scaleMin, scaleMax, foundIncr, foundSpace) => {
+	return (self, axisIdx, scaleMin, scaleMax, foundIncr, foundSpace) => {
 		const ticks = inner(self, axisIdx, scaleMin, scaleMax, foundIncr, foundSpace);
-		const [lower, upper] = domainOf(inner, scaleMin, scaleMax);
 		// Both modes go through the same merge, so the two differ only in *when* the edges are
 		// added, never in what the decorator guarantees about the result. The empty-inner case is
 		// the same call with nothing to merge into.
 		if (mode === 'always' || ticks.length === 0) {
-			return mergeTicks(ticks, [lower, upper], lower, upper);
+			return mergeTicks(ticks, [scaleMin, scaleMax], scaleMin, scaleMax);
 		}
 		return ticks;
-	}, inner);
+	};
 }

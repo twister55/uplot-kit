@@ -917,15 +917,10 @@ describe('splitsWithInclude', () => {
 		expect(result).toEqual([0, 10, 20, 30]);
 	});
 
-	it('clamps injected values to the visible range even when the domain is wider', () => {
-		// a domain computed from the data extent rather than from the arguments survives every
-		// pan and zoom; without intersecting it with the visible range the injected values ride
-		// along off-screen
-		const inner: SplitsFn = Object.assign(
-			(_self: uPlot, _axisIdx: number, min: number, max: number): number[] =>
-				[0, 25, 50, 75, 100].filter((value) => value >= min && value <= max),
-			{ domain: (): [number, number] => [0, 100] }
-		);
+	it('clamps injected values to the visible range', () => {
+		// a threshold outside the current zoom is dropped rather than extending the axis
+		const inner: SplitsFn = (_self, _axisIdx, min, max) =>
+			[0, 25, 50, 75, 100].filter((value) => value >= min && value <= max);
 
 		expect(splitsWithInclude(inner, [0, 50, 100])(fakeSelf(), 0, 40, 60, 0, 0)).toEqual([50]);
 		expect(splitsWithEdges(inner, { mode: 'always' })(fakeSelf(), 0, 40, 60, 0, 0)).toEqual([
@@ -946,12 +941,12 @@ describe('splitsWithInclude', () => {
 		expect(wrapped(fakeSelf(), 0, 0, 30, 0, 0)).toEqual([0, 10, 20, 25, 30]);
 	});
 
-	it('clamps injected values to the inner domain, not just the raw range', () => {
-		const wrapped = splitsWithInclude(splitsForCategory({ count: 5 }), [-0.5, 4, 5.5]);
+	it('includes valid category indices on a default ordinal axis', () => {
+		// uPlot's default ordinal x range is exactly [0, count - 1], so the injected values are
+		// clamped to that without any category-specific machinery
+		const wrapped = splitsWithInclude(splitsForCategory({ count: 5 }), [2, 4]);
 
-		// -0.5 and 5.5 sit in uPlot's ordinal padding, which `count` exists to exclude — the
-		// decorator must not put back what the generator refused
-		expect(wrapped(fakeSelf(), 0, -0.5, 5.5, 0, 0)).toEqual([0, 1, 2, 3, 4]);
+		expect(wrapped(fakeSelf(), 0, 0, 4, 0, 0)).toEqual([0, 1, 2, 3, 4]);
 	});
 });
 
@@ -1053,6 +1048,27 @@ describe('splitsWithFilter', () => {
 		expect(seen.length).toBeGreaterThan(0);
 		expect(seen.every((entry) => entry.self === self && entry.axisIdx === 2)).toBe(true);
 	});
+
+	it('filters the edges too when wrapped outside splitsWithEdges', () => {
+		const isWeekday = (value: number) => {
+			const day = new Date(value * 1000).getUTCDay();
+			return day !== 0 && day !== 6;
+		};
+		const sat = Date.UTC(2026, 0, 3) / 1000;
+		const sunNoon = Date.UTC(2026, 0, 4, 12) / 1000;
+		const inner = splitsForTime({ granularity: 'day' });
+
+		// filter INSIDE: the whenEmpty fallback re-adds the weekend edges the filter removed,
+		// so a weekend-hiding axis shows two weekend ticks — the documented wrong order
+		expect(
+			splitsWithEdges(splitsWithFilter(inner, isWeekday))(fakeSelf(), 0, sat, sunNoon, 0, 0)
+		).toEqual([sat, sunNoon]);
+
+		// filter OUTSIDE: the edges pass through the predicate, so the weekend window stays empty
+		expect(
+			splitsWithFilter(splitsWithEdges(inner), isWeekday)(fakeSelf(), 0, sat, sunNoon, 0, 0)
+		).toEqual([]);
+	});
 });
 
 describe('splitsForCategory', () => {
@@ -1072,10 +1088,11 @@ describe('splitsForCategory', () => {
 		expect(result).toEqual([0, 2, 4, 6, 8]);
 	});
 
-	it('clamps ticks to [0, count - 1] on a padded ordinal range', () => {
+	it('clamps ticks to [0, count - 1] on a scale wider than the data', () => {
 		const splits = splitsForCategory({ count: 5 });
 
-		// uPlot pads ordinal scales, so scaleMin/scaleMax can extend past real categories
+		// an explicit scales.x.range, or an ordinal y scale (which uPlot pads), can extend the
+		// scale past the real categories; count keeps ticks off the region with no category
 		const result = splits(fakeSelf(), 0, -0.5, 5.5, 0, 0);
 
 		expect(result).toEqual([0, 1, 2, 3, 4]);
@@ -1203,23 +1220,16 @@ describe('splitsWithEdges', () => {
 		}
 	});
 
-	it('uses the first and last real category as edges, not the ordinal padding', () => {
-		const wrapped = splitsWithEdges(splitsForCategory({ count: 5 }), { mode: 'always' });
+	it('adds the category-index edges on a default ordinal axis', () => {
+		// uPlot's default ordinal x range is exactly [0, count - 1], so the raw edges the
+		// decorator injects are already the first and last real category
+		const wrapped = splitsWithEdges(splitsForCategory({ count: 5, step: 3 }), { mode: 'always' });
 
-		// uPlot pads an ordinal scale, so scaleMin/scaleMax straddle the real categories;
-		// injecting the raw edges would undo exactly what `count` is for
-		expect(wrapped(fakeSelf(), 0, -0.5, 5.5, 0, 0)).toEqual([0, 1, 2, 3, 4]);
+		// step 3 ticks only 0 and 3; the edges fill in 0 (already there) and 4
+		expect(wrapped(fakeSelf(), 0, 0, 4, 0, 0)).toEqual([0, 3, 4]);
 	});
 
-	it('adds no edges at all when the window is entirely past the last category', () => {
-		const wrapped = splitsWithEdges(splitsForCategory({ count: 5 }));
-
-		// the domain is empty here, so there is no meaningful edge to fall back to — two ticks
-		// with no category behind them would be worse than a blank axis
-		expect(wrapped(fakeSelf(), 0, 10, 20, 0, 0)).toEqual([]);
-	});
-
-	it('still falls back to the domain edges when the window is inside the categories', () => {
+	it('falls back to the range edges when the inner function is empty inside the categories', () => {
 		// step 3 skips over indices 1 and 2, so the inner function has nothing to return here
 		const wrapped = splitsWithEdges(splitsForCategory({ count: 5, step: 3 }));
 
@@ -1243,7 +1253,7 @@ describe('splitsWithEdges', () => {
 		]);
 	});
 
-	it('carries the inner domain through a chain of decorators', () => {
+	it('composes through a chain of decorators', () => {
 		const wrapped = splitsWithEdges(
 			splitsWithLimit(
 				splitsWithFilter(splitsForCategory({ count: 5 }), () => true),
@@ -1252,8 +1262,7 @@ describe('splitsWithEdges', () => {
 			{ mode: 'always' }
 		);
 
-		// each decorator re-publishes the domain, so the narrowing survives every wrap
-		expect(wrapped(fakeSelf(), 0, -0.5, 5.5, 0, 0)).toEqual([0, 1, 2, 3, 4]);
+		expect(wrapped(fakeSelf(), 0, 0, 4, 0, 0)).toEqual([0, 1, 2, 3, 4]);
 	});
 
 	it('falls back to the raw range for a generator that declares no domain', () => {
