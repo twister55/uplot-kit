@@ -386,36 +386,90 @@ function startOfYear(sec: number, offsetSec: number, yearDelta = 0): number {
  */
 export type SplitsForTimeGranularity = 'day' | 'week' | 'month' | 'quarter' | 'year';
 
+// The units in coarseness order, so a rung can be compared against the requested floor by index.
+// The public granularity option is one of these; the ladder below has several rungs per unit
+// (a day-unit rung ticking every day, another every four), and a floor keeps the rungs at or
+// above its own unit.
+const GRANULARITY_ORDER: readonly SplitsForTimeGranularity[] = [
+	'day',
+	'week',
+	'month',
+	'quarter',
+	'year'
+];
+
 // Per-call context the level walkers need beyond the timestamp — kept as one object so a
 // new locale/offset knob (like weekStartsOn) is threaded without widening every closure's
 // signature.
 type SplitContext = { offsetSec: number; weekStartsOn: number };
 
-type SplitLevel = {
-	granularity: SplitsForTimeGranularity;
-	rangeLimit: number;
+type RungStep = {
 	getInitialValue: (scaleMin: number, ctx: SplitContext) => number;
 	getNextValue: (currentValue: number, ctx: SplitContext) => number;
 };
 
-// Widening ladder of calendar-aligned tick steps, ordered finest → coarsest. The splits
-// function starts at the level matching the requested granularity and picks the first whose
-// rangeLimit covers the current scale range, so ticks land on round calendar boundaries
-// (day/week/month/quarter/year starts) rather than arbitrary equal-width divisions. Each
-// level is keyed by its granularity name so selection has a single source of truth (no
-// parallel step table to drift out of sync).
-// The coarsest level, named so the level lookup below has a total fallback the compiler can
-// see is defined (its rangeLimit is Infinity, so the lookup never actually misses).
-const YEAR_LEVEL: SplitLevel = {
-	granularity: 'year',
-	rangeLimit: Infinity,
-	getInitialValue: (scaleMin, ctx) => startOfYear(scaleMin, ctx.offsetSec),
-	getNextValue: (currentValue, ctx) => startOfYear(currentValue, ctx.offsetSec, 1)
+type SplitLevel = RungStep & {
+	// Which granularity this rung belongs to, for the floor comparison. Several rungs share a
+	// unit (every day / every four days are both 'day'), and a rung is coarser than its unit
+	// suggests only within it — the ladder stays globally ordered finest → coarsest.
+	unit: SplitsForTimeGranularity;
+	rangeLimit: number;
 };
 
-// The granularity an omitted or unrecognized option resolves to. It is deliberately the ladder's
-// first entry — falling back to it means keeping every rung, which is what `slice(0)` below
-// expresses — so moving it here would need that slice to look the index up instead.
+// The ladder's rungs are built from four aligned-step generators, one per calendar unit. Every
+// step is phased to a fixed origin (the epoch for days, the year for months and years, the week
+// boundary for weeks) rather than to scaleMin, so the ticks a given zoom level shows do not
+// shift as the user pans — the defining property a "round boundary" axis needs.
+
+// Every `n`-th day, counted from the epoch so a 2- or 4-day rung lands on the same days no matter
+// where the window sits. n = 1 is a plain day boundary.
+function everyNDays(n: number): RungStep {
+	return {
+		getInitialValue: (scaleMin, ctx) => {
+			const dayIndex = Math.floor((scaleMin + ctx.offsetSec) / SECONDS_PER_DAY);
+			return Math.ceil(dayIndex / n) * n * SECONDS_PER_DAY - ctx.offsetSec;
+		},
+		getNextValue: (currentValue) => currentValue + n * SECONDS_PER_DAY
+	};
+}
+
+// Every `n`-th week from the week boundary `weekStartsOn` selects. n = 1 is a plain week.
+function everyNWeeks(n: number): RungStep {
+	return {
+		getInitialValue: (scaleMin, ctx) => startOfWeek(scaleMin, ctx.offsetSec, ctx.weekStartsOn),
+		getNextValue: (currentValue) => currentValue + n * SECONDS_PER_WEEK
+	};
+}
+
+// Every `n`-th month, counted from the start of a year so the rung lands on round month starts:
+// n = 2 gives Jan/Mar/May…, n = 3 (a quarter) Jan/Apr/Jul/Oct, n = 6 Jan/Jul.
+function everyNMonths(n: number): RungStep {
+	return {
+		getInitialValue: (scaleMin, ctx) => {
+			scratchDate.setTime((scaleMin + ctx.offsetSec) * 1000);
+			const monthIndex = scratchDate.getUTCFullYear() * 12 + scratchDate.getUTCMonth();
+			const aligned = Math.ceil(monthIndex / n) * n;
+			return utcMonthStart(Math.floor(aligned / 12), aligned % 12) / 1000 - ctx.offsetSec;
+		},
+		getNextValue: (currentValue, ctx) => startOfMonth(currentValue, ctx.offsetSec, n)
+	};
+}
+
+// Every `n`-th year, phased so the rung lands on round years: n = 10 gives decades (…2020, 2030),
+// n = 100 centuries.
+function everyNYears(n: number): RungStep {
+	return {
+		getInitialValue: (scaleMin, ctx) => {
+			scratchDate.setTime((scaleMin + ctx.offsetSec) * 1000);
+			const year = Math.ceil(scratchDate.getUTCFullYear() / n) * n;
+			return utcMonthStart(year, 0) / 1000 - ctx.offsetSec;
+		},
+		getNextValue: (currentValue, ctx) => startOfYear(currentValue, ctx.offsetSec, n)
+	};
+}
+
+// The granularity an omitted or unrecognized option resolves to — the finest, so the default
+// axis can tick at any scale.
 const DEFAULT_GRANULARITY: SplitsForTimeGranularity = 'day';
 
 // Unix seconds, matching uPlot's own default for the option this mirrors.
@@ -424,32 +478,35 @@ const DEFAULT_MS = 1e-3;
 // Decimal decades, matching uPlot's own default `log`.
 const DEFAULT_BASE = 10;
 
+// The coarsest rung, hoisted so the range lookup below has a total fallback the compiler can see
+// is defined — its Infinity limit means the lookup never actually misses.
+const COARSEST_RUNG: SplitLevel = { unit: 'year', rangeLimit: Infinity, ...everyNYears(100) };
+
+// The widening ladder, finest → coarsest. The splits function keeps the rungs at or above the
+// requested granularity, then picks the first whose rangeLimit covers the visible range — so
+// every tick lands on a round calendar boundary and the tick count stays roughly 4–14 across
+// every zoom, with no rung more than ~2x sparser than the one before it. The intermediate rungs
+// (2- and 4-day, 2-week, 2-month, half-year, and the 2/5/10/25/50/100-year rungs) exist to keep
+// those crossovers gradual: a bare day/week/month/quarter/year ladder collapses from a dense axis
+// to two or three ticks the moment the range crosses a limit, and stops widening past a few years.
+// The limits are in seconds; `rangeLimit` is the largest visible range the rung still handles.
 const SPLIT_LEVELS: SplitLevel[] = [
-	{
-		granularity: 'day',
-		rangeLimit: SECONDS_PER_DAY * 10,
-		getInitialValue: (scaleMin, ctx) => startOfDay(scaleMin, ctx.offsetSec),
-		getNextValue: (currentValue) => currentValue + SECONDS_PER_DAY
-	},
-	{
-		granularity: 'week',
-		rangeLimit: SECONDS_PER_WEEK * 10,
-		getInitialValue: (scaleMin, ctx) => startOfWeek(scaleMin, ctx.offsetSec, ctx.weekStartsOn),
-		getNextValue: (currentValue) => currentValue + SECONDS_PER_WEEK
-	},
-	{
-		granularity: 'month',
-		rangeLimit: APPROXIMATE_YEAR,
-		getInitialValue: (scaleMin, ctx) => startOfMonth(scaleMin, ctx.offsetSec),
-		getNextValue: (currentValue, ctx) => startOfMonth(currentValue, ctx.offsetSec, 1)
-	},
-	{
-		granularity: 'quarter',
-		rangeLimit: 3 * APPROXIMATE_YEAR,
-		getInitialValue: (scaleMin, ctx) => startOfYear(scaleMin, ctx.offsetSec),
-		getNextValue: (currentValue, ctx) => startOfMonth(currentValue, ctx.offsetSec, 3)
-	},
-	YEAR_LEVEL
+	{ unit: 'day', rangeLimit: SECONDS_PER_DAY * 8, ...everyNDays(1) },
+	{ unit: 'day', rangeLimit: SECONDS_PER_DAY * 18, ...everyNDays(2) },
+	{ unit: 'day', rangeLimit: SECONDS_PER_DAY * 36, ...everyNDays(4) },
+	{ unit: 'week', rangeLimit: SECONDS_PER_DAY * 55, ...everyNWeeks(1) },
+	{ unit: 'week', rangeLimit: SECONDS_PER_DAY * 110, ...everyNWeeks(2) },
+	{ unit: 'month', rangeLimit: SECONDS_PER_DAY * 200, ...everyNMonths(1) },
+	{ unit: 'month', rangeLimit: SECONDS_PER_DAY * 400, ...everyNMonths(2) },
+	{ unit: 'quarter', rangeLimit: SECONDS_PER_DAY * 800, ...everyNMonths(3) },
+	{ unit: 'quarter', rangeLimit: SECONDS_PER_DAY * 1600, ...everyNMonths(6) },
+	{ unit: 'year', rangeLimit: APPROXIMATE_YEAR * 13, ...everyNYears(1) },
+	{ unit: 'year', rangeLimit: APPROXIMATE_YEAR * 26, ...everyNYears(2) },
+	{ unit: 'year', rangeLimit: APPROXIMATE_YEAR * 65, ...everyNYears(5) },
+	{ unit: 'year', rangeLimit: APPROXIMATE_YEAR * 130, ...everyNYears(10) },
+	{ unit: 'year', rangeLimit: APPROXIMATE_YEAR * 330, ...everyNYears(25) },
+	{ unit: 'year', rangeLimit: APPROXIMATE_YEAR * 650, ...everyNYears(50) },
+	COARSEST_RUNG
 ];
 
 export interface SplitsForTimeOptions {
@@ -551,14 +608,13 @@ export function splitsForTime(options: SplitsForTimeOptions = {}): SplitsFn {
 		warn,
 		'granularity',
 		rawGranularity,
-		SPLIT_LEVELS.some((level) => level.granularity === rawGranularity),
-		`one of ${SPLIT_LEVELS.map((level) => `'${level.granularity}'`).join(', ')}`,
+		GRANULARITY_ORDER.includes(rawGranularity),
+		`one of ${GRANULARITY_ORDER.map((unit) => `'${unit}'`).join(', ')}`,
 		DEFAULT_GRANULARITY
 	);
-	// DEFAULT_GRANULARITY is the ladder's first entry, so the fallback keeps every rung.
-	const levels = SPLIT_LEVELS.slice(
-		SPLIT_LEVELS.findIndex((level) => level.granularity === granularity)
-	);
+	// Keep the rungs at or above the requested unit — the floor. 'day' keeps them all.
+	const floorRank = GRANULARITY_ORDER.indexOf(granularity);
+	const levels = SPLIT_LEVELS.filter((level) => GRANULARITY_ORDER.indexOf(level.unit) >= floorRank);
 
 	// Sunday-relative day index, so anything but a whole 0..6 describes no week start at all —
 	// and a fractional one is the dangerous shape, since it shifts every tick by a fraction of a
@@ -607,7 +663,7 @@ export function splitsForTime(options: SplitsForTimeOptions = {}): SplitsFn {
 		// non-finite bounds and the `ms` guard above has rejected a zero or non-finite scale —
 		// but a denormal-small unit can still overflow the division, so the fallback stays a
 		// real backstop rather than a formality.
-		const level = levels.find((candidate) => range <= candidate.rangeLimit) ?? YEAR_LEVEL;
+		const level = levels.find((candidate) => range <= candidate.rangeLimit) ?? COARSEST_RUNG;
 
 		// Walk the calendar boundaries: start at the rung's boundary at or before minSec and
 		// advance by its own irregular step until past maxSec. The arithmetic generators go
@@ -1002,19 +1058,19 @@ export function splitsWithInclude(inner: SplitsFn, values: number[]): SplitsFn {
 }
 
 /**
- * Wraps a `SplitsFn` so it never returns more than `max` ticks, thinning evenly (keeping
+ * Wraps a `SplitsFn` so it never returns more than `maxTicks` ticks, thinning evenly (keeping
  * every k-th tick) when the inner function returns more — a guard against overlapping labels
- * on a dense axis. Thinning is by tick count, not measured label pixel width; pair with
+ * on a dense axis. `maxTicks` is a count, not a measured label pixel width; pair with
  * `axis.rotate` or a shorter label formatter for tight spaces.
  *
- * Even spacing is preserved in preference to hitting `max` exactly: the result keeps every
- * k-th tick for the smallest k that fits under the limit, so a tick set only slightly over
- * `max` can thin well below it (11 ticks with `max: 10` gives 6, at k = 2). A fractional `max`
- * is floored, so a measured `plotWidth / labelWidth` needs no rounding at the call site.
- * A `max` that isn't a usable number — `NaN` from a not-yet-measured label width, or the
- * `undefined` / `null` a JS caller passes for the same reason — means the limit is unknown, not
- * that nothing fits, and passes the inner ticks through, as does an explicit `Infinity`. A `max`
- * below one — `-Infinity` and zero included — yields no ticks.
+ * Even spacing is preserved in preference to hitting `maxTicks` exactly: the result keeps every
+ * k-th tick for the smallest k that fits under the limit, so a tick set only slightly over it
+ * can thin well below (11 ticks with `maxTicks: 10` gives 6, at k = 2). A fractional value is
+ * floored, so a measured `plotWidth / labelWidth` needs no rounding at the call site. A value
+ * that isn't a usable number — `NaN` from a not-yet-measured label width, or the `undefined` /
+ * `null` a JS caller passes for the same reason — means the limit is unknown, not that nothing
+ * fits, and passes the inner ticks through, as does an explicit `Infinity`. A value below one —
+ * `-Infinity` and zero included — yields no ticks.
  *
  * @example
  * ```ts
@@ -1038,23 +1094,23 @@ export function splitsWithInclude(inner: SplitsFn, values: number[]): SplitsFn {
  * new uPlot(opts, data, document.body);
  * ```
  */
-export function splitsWithLimit(inner: SplitsFn, max: number): SplitsFn {
+export function splitsWithLimit(inner: SplitsFn, maxTicks: number): SplitsFn {
 	return (self, axisIdx, scaleMin, scaleMax, foundIncr, foundSpace) => {
 		const ticks = inner(self, axisIdx, scaleMin, scaleMax, foundIncr, foundSpace);
-		// "Not measured yet" is not "show nothing", so an unusable `max` passes the ticks
+		// "Not measured yet" is not "show nothing", so an unusable limit passes the ticks
 		// through unthinned rather than blanking the axis. It arrives spelled three ways: `NaN`
 		// from a division that had a zero label width, and — since the caller doing the
 		// measuring is often plain JS — `undefined` or `null` from a width that was never
 		// assigned. `Infinity` is an explicit no-limit and lands in the same place. `-Infinity`
 		// is deliberately not in this company: it orders below every real limit, so it falls
 		// through to the "nothing fits" case below.
-		if (typeof max !== 'number' || Number.isNaN(max) || max === Infinity) {
+		if (typeof maxTicks !== 'number' || Number.isNaN(maxTicks) || maxTicks === Infinity) {
 			return ticks;
 		}
-		// Floored, because a measurement-derived max is the fractional `plotWidth / labelWidth`
-		// and half a label does not fit. Thinning against the raw fraction would bound the
-		// result by ceil(max) instead of max — 11 ticks under `max: 2.5` would return 3.
-		const limit = Math.floor(max);
+		// Floored, because a measurement-derived limit is the fractional `plotWidth / labelWidth`
+		// and half a label does not fit. Thinning against the raw fraction would bound the result
+		// by ceil(maxTicks) instead of maxTicks — 11 ticks under `maxTicks: 2.5` would return 3.
+		const limit = Math.floor(maxTicks);
 		if (limit <= 0) {
 			return [];
 		}

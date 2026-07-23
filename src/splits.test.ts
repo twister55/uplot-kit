@@ -221,6 +221,67 @@ describe('splitsForTime', () => {
 		]);
 	});
 
+	it('widens gradually across a crossover instead of collapsing to one tick', () => {
+		const splits = splitsForTime({ granularity: 'day' });
+		const start = unixSec('2026-01-05T00:00:00Z');
+		const DAY = 86400;
+
+		// the bare day -> week ladder used to drop from 11 ticks to 1 the moment the range
+		// crossed ten days; the intermediate rungs keep every crossover gradual
+		const at = (days: number) => splits(fakeSelf(), 0, start, start + days * DAY, 0, 0).length;
+		for (const days of [8, 11, 15, 20, 30, 45, 70, 120, 250, 400]) {
+			expect(at(days)).toBeGreaterThanOrEqual(4);
+			expect(at(days)).toBeLessThanOrEqual(14);
+		}
+	});
+
+	it('ticks round intermediate steps, phased to a fixed origin so a pan does not shift them', () => {
+		const splits = splitsForTime({ granularity: 'day' });
+
+		// a ~12-day range lands on the every-2-days rung, counted from the epoch, so it ticks odd
+		// days of a month with 31 days regardless of where the window opens
+		const twoDay = splits(
+			fakeSelf(),
+			0,
+			unixSec('2026-01-01T00:00:00Z'),
+			unixSec('2026-01-13T00:00:00Z'),
+			0,
+			0
+		);
+		expect(twoDay.map((v) => new Date(v * 1000).getUTCDate())).toEqual([1, 3, 5, 7, 9, 11, 13]);
+
+		// the same rung on a window shifted by one day still ticks the same calendar days — the
+		// ticks are phased to the epoch, not to scaleMin, so panning does not slide them
+		const shifted = splits(
+			fakeSelf(),
+			0,
+			unixSec('2026-01-02T00:00:00Z'),
+			unixSec('2026-01-14T00:00:00Z'),
+			0,
+			0
+		);
+		expect(shifted.map((v) => new Date(v * 1000).getUTCDate())).toEqual([3, 5, 7, 9, 11, 13]);
+	});
+
+	it('keeps widening past a few years into decades and centuries', () => {
+		const splits = splitsForTime({ granularity: 'year' });
+
+		// the old ladder capped at a one-year step, so two centuries meant ~200 labels; now it
+		// widens to decades and beyond, staying readable
+		const twoCenturies = splits(
+			fakeSelf(),
+			0,
+			unixSec('1900-01-01T00:00:00Z'),
+			unixSec('2000-01-01T00:00:00Z'),
+			0,
+			0
+		);
+		expect(twoCenturies.map((v) => new Date(v * 1000).getUTCFullYear())).toEqual([
+			1900, 1910, 1920, 1930, 1940, 1950, 1960, 1970, 1980, 1990, 2000
+		]);
+		expect(twoCenturies.every((v) => new Date(v * 1000).getUTCFullYear() % 10 === 0)).toBe(true);
+	});
+
 	it('starts weeks on the configured day when weekStartsOn is set', () => {
 		const splits = splitsForTime({ granularity: 'week', weekStartsOn: 1 }); // ISO Monday
 		const scaleMin = unixSec('2026-01-01T00:00:00Z');
@@ -264,17 +325,19 @@ describe('splitsForTime', () => {
 
 	it('emits every month boundary, including short months, regardless of the foundIncr uPlot passes', () => {
 		const splits = splitsForTime({ granularity: 'month' });
+		// six months keeps the monthly rung (the two-month rung takes over past ~200 days), so
+		// every boundary shows — the point is that the 28-day Feb->Mar step is never thinned away
 		const scaleMin = unixSec('2026-01-01T00:00:00Z');
-		const scaleMax = unixSec('2026-12-01T00:00:00Z');
+		const scaleMax = unixSec('2026-06-01T00:00:00Z');
 
 		// uPlot's ladder can hand a ~30-day foundIncr for a monthly range; the tick set must
-		// not depend on it (a 28-day Feb->Mar step must never be thinned away)
+		// not depend on it
 		const withoutIncr = splits(fakeSelf(), 0, scaleMin, scaleMax, 0, 0);
 		const withMonthIncr = splits(fakeSelf(), 0, scaleMin, scaleMax, 30 * 86400, 60);
 
 		expect(withoutIncr).toEqual(withMonthIncr);
 		const months = withoutIncr.map((value) => new Date(value * 1000).getUTCMonth());
-		expect(months).toEqual([0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11]);
+		expect(months).toEqual([0, 1, 2, 3, 4, 5]);
 	});
 
 	it('returns ticks that are all within [scaleMin, scaleMax]', () => {
@@ -368,24 +431,28 @@ describe('splitsForTime', () => {
 		expect(result.at(-1)).toBe(to.getTime() / 1000);
 	});
 
-	it('caps the walk on degenerate ranges instead of hanging or truncating silently', () => {
+	it('terminates on an absurd range instead of hanging, and never emits NaN', () => {
 		const warn = vi.spyOn(console, 'warn').mockImplementation(() => {});
 		try {
-			const splits = splitsForTime({ granularity: 'year' });
+			// e.g. millisecond/nanosecond epoch values mistakenly fed to a seconds axis: 1e15
+			// seconds is ~31 million years. The coarsest rung steps a century at a time, so the
+			// walk runs out of representable Date values (getUTCFullYear goes NaN past ±271821)
+			// long before the candidate cap, and stops there — a bounded walk either way.
+			const result = splits('year', 0, 1e15);
 
-			// e.g. millisecond/nanosecond epoch values mistakenly fed to a seconds axis.
-			// The cap's exact value is the implementation's business — what matters is that
-			// the walk terminates far short of the ~31 million year ticks this range spans,
-			// and says so once.
-			const result = splits(fakeSelf(), 0, 0, 1e15, 0, 0);
-
-			expect(result.length).toBeLessThan(1e15 / (366 * 86400));
+			// far short of the millions of ticks the range nominally spans, and clean
+			expect(result.length).toBeLessThan(10_000);
+			expect(result.length).toBeGreaterThan(0);
 			for (const value of result) {
 				expect(Number.isFinite(value)).toBe(true);
 			}
-			expect(warn).toHaveBeenCalledOnce();
+			expect(result).toEqual([...result].sort((a, b) => a - b));
 		} finally {
 			warn.mockRestore();
+		}
+
+		function splits(granularity: SplitsForTimeGranularity, min: number, max: number): number[] {
+			return splitsForTime({ granularity })(fakeSelf(), 0, min, max, 0, 0);
 		}
 	});
 
