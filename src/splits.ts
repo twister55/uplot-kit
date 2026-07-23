@@ -3,8 +3,8 @@
 // SplitsFn`) that wrap any of them to inject, filter, or thin ticks. Where `incrs` answers
 // "which step sizes are allowed" (uPlot then builds an even grid from one), `splits` answers
 // "where exactly do ticks land" — the full override uPlot's own evenly-spaced default can't
-// express calendar-irregular (splitsForTime), logarithmic (splitsForLog), or anchored (splitsForStep)
-// tick placement.
+// express: calendar-irregular (splitsForTime), logarithmic (splitsForLog), or anchored
+// (splitsForStep) tick placement.
 
 import type uPlot from 'uplot';
 
@@ -58,13 +58,16 @@ export type SplitsDomainFn = (scaleMin: number, scaleMax: number) => [number, nu
 
 // --- Shared helpers (private) ---
 
-// Degenerate-range guard common to every generator below: non-finite bounds and an inverted
-// range both mean "nothing sensible to tick". A zero-width range — the one case uPlot itself
-// passes through unpadded (single-point data) — is deliberately *not* special-cased: letting
-// it flow through the generator's own grid means the collapsed value ticks only when it is a
-// real grid position (a calendar boundary, a decade, a step multiple), instead of becoming the
-// single off-grid tick the generator would never otherwise emit. splitsWithEdges is how a
-// caller opts into a tick there regardless.
+// The part of the degenerate-range guard the generators share: non-finite bounds and an inverted
+// range both mean "nothing sensible to tick". It is only the shared part — each generator adds
+// its own (splitsForLog rejects scaleMin <= 0, splitsForCategory tests the clamped domain rather
+// than the raw range), so this is a predicate to build on, not the whole policy.
+//
+// A zero-width range — the one case uPlot itself passes through unpadded (single-point data)
+// — is deliberately *not* special-cased. Letting it flow through the generator's own grid means
+// the collapsed value ticks only when it is a real grid position (a calendar boundary, a decade,
+// a step multiple), instead of becoming the single off-grid tick the generator would never
+// otherwise emit. splitsWithEdges is how a caller opts into a tick there regardless.
 function isTickable(scaleMin: number, scaleMax: number): boolean {
 	return Number.isFinite(scaleMin) && Number.isFinite(scaleMax) && scaleMin <= scaleMax;
 }
@@ -104,12 +107,14 @@ function optionOr<T>(
 		return value;
 	}
 	warn(
-		`${name} must be ${requirement}, got ${JSON.stringify(value)} — falling back to ${JSON.stringify(fallback)}`
+		`${name} must be ${requirement}, got ${JSON.stringify(value)} — ` +
+			`falling back to ${JSON.stringify(fallback)}`
 	);
 	return fallback;
 }
 
-const CAP_REACHED = `stopped after ${MAX_TICK_CANDIDATES} tick candidates — the scale range looks degenerate`;
+const CAP_REACHED =
+	`stopped after ${MAX_TICK_CANDIDATES} tick candidates — ` + 'the scale range looks degenerate';
 
 // The one candidate cap every generator shares. `push` reports whether the caller may keep
 // going, so the three shapes of tick generation below — the calendar walk, the arithmetic
@@ -120,7 +125,6 @@ const CAP_REACHED = `stopped after ${MAX_TICK_CANDIDATES} tick candidates — th
 type TickCollector = {
 	values: number[];
 	push: (value: number) => boolean;
-	pushAll: (values: number[]) => boolean;
 	warn: (detail: string) => void;
 };
 
@@ -134,28 +138,7 @@ function makeCollector(warn: (detail: string) => void): TickCollector {
 		values.push(value);
 		return true;
 	};
-	// `every` short-circuits on the first refusal, so a capped batch stops mid-way like a
-	// hand-rolled loop would.
-	return { values, push, pushAll: (more) => more.every((value) => push(value)), warn };
-}
-
-// Walks from `from` while `<= max`, advancing via `next`. Used only by splitsForTime, whose
-// steps are calendar-irregular; the arithmetic generators go through stepGrid() instead,
-// which is drift-free.
-function walk(
-	from: number,
-	max: number,
-	next: (value: number) => number,
-	into: TickCollector
-): number[] {
-	let value = from;
-	while (Number.isFinite(value) && value <= max) {
-		if (!into.push(value)) {
-			break;
-		}
-		value = next(value);
-	}
-	return into.values;
+	return { values, push, warn };
 }
 
 // Attaches a domain to a freshly built SplitsFn; see SplitsDomainFn.
@@ -330,7 +313,8 @@ function stepGrid(
 	// it leaves the caller a real choice — a coarser step, or a narrower range.
 	if (Math.floor((upper - anchor) / step) - firstIndex + 1 > MAX_TICK_CANDIDATES) {
 		into.warn(
-			`the range spans more than ${MAX_TICK_CANDIDATES} ticks at this step — widen the step or narrow the range`
+			`the range spans more than ${MAX_TICK_CANDIDATES} ticks at this step — ` +
+				'widen the step or narrow the range'
 		);
 		return into.values;
 	}
@@ -670,12 +654,21 @@ export function splitsForTime(options: SplitsForTimeOptions = {}): SplitsFn {
 		// real backstop rather than a formality.
 		const level = levels.find((candidate) => range <= candidate.rangeLimit) ?? YEAR_LEVEL;
 
-		const ticks = walk(
-			level.getInitialValue(minSec, ctx),
-			maxSec,
-			(currentValue) => level.getNextValue(currentValue, ctx),
-			makeCollector(warn)
-		);
+		// Walk the calendar boundaries: start at the rung's boundary at or before minSec and
+		// advance by its own irregular step until past maxSec. The arithmetic generators go
+		// through stepGrid() instead, whose even step is drift-free; a calendar step is not, so
+		// it is walked rather than indexed. The collector caps a walk that a degenerate range
+		// would otherwise run unbounded.
+		const collector = makeCollector(warn);
+		for (
+			let value = level.getInitialValue(minSec, ctx);
+			Number.isFinite(value) && value <= maxSec;
+			value = level.getNextValue(value, ctx)
+		) {
+			if (!collector.push(value)) {
+				break;
+			}
+		}
 
 		// Not normalize(): the walk is strictly ascending and unique by construction, so its
 		// dedupe and sort are dead work, and the only part that isn't — the lower clamp — is one
@@ -686,7 +679,7 @@ export function splitsForTime(options: SplitsForTimeOptions = {}): SplitsFn {
 		//
 		// Scaling by 1 is exact, so the seconds path costs nothing for sharing this loop.
 		const result: number[] = [];
-		for (const value of ticks) {
+		for (const value of collector.values) {
 			if (value >= minSec) {
 				result.push(value * unitsPerSec);
 			}
@@ -808,7 +801,9 @@ export function splitsForLog(options: SplitsForLogOptions = {}): SplitsFn {
 					values.push(roundSignificant(mantissa * decade));
 				}
 			}
-			if (!collector.pushAll(values)) {
+			// every() short-circuits on the first refusal, so a decade that trips the cap stops
+			// mid-batch instead of overshooting it.
+			if (!values.every((value) => collector.push(value))) {
 				break;
 			}
 		}
@@ -820,7 +815,11 @@ export function splitsForLog(options: SplitsForLogOptions = {}): SplitsFn {
 // --- splitsForStep ---
 
 export interface SplitsForStepOptions {
-	/** Fixed spacing between ticks, in axis units. */
+	/**
+	 * Fixed spacing between ticks, in axis units. Required and has no default — a grid with
+	 * no spacing is not a grid; a value that is not finite and positive warns once and ticks
+	 * nothing.
+	 */
 	step: number;
 	/**
 	 * Axis value the tick grid is phased against — ticks land at `anchor + k * step`
@@ -976,7 +975,8 @@ export function splitsForCategory(options: SplitsForCategoryOptions = {}): Split
 	let count = rawCount;
 	if (count !== undefined && !(Number.isInteger(count) && count >= 0)) {
 		warn(
-			`count must be a whole number of categories, got ${JSON.stringify(count)} — ignoring it, so ticks are clamped to the visible range only`
+			`count must be a whole number of categories, got ${JSON.stringify(count)} — ` +
+				'ignoring it, so ticks are clamped to the visible range only'
 		);
 		count = undefined;
 	}
