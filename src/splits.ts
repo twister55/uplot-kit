@@ -315,10 +315,20 @@ function normalize(values: number[], scaleMin: number, scaleMax: number): number
 // generator's own correction. A tick set is the inner function's business; the decorator only
 // answers for what it adds.
 function mergeTicks(ticks: number[], injected: number[], lower: number, upper: number): number[] {
-	const additions = injected.filter(
-		(value) => value >= lower && value <= upper && !ticks.some((tick) => isSameTick(tick, value))
-	);
-	return [...new Set([...ticks, ...additions])].sort((a, b) => a - b);
+	// Each injected value is tested against everything already kept — the inner ticks AND the
+	// injected values accepted before it — not just against `ticks`. Testing only against `ticks`
+	// let two injected values that are isSameTick to each other but not `===` (e.g. 0.3 and
+	// 0.1 + 0.2, or two edges an ulp apart on a near-zero-width range) both survive the final Set,
+	// which dedupes by exact equality only — the very sub-pixel double-tick isSameTick exists to
+	// prevent. The injected lists here are tiny (thresholds, the two range edges), so the
+	// quadratic scan is free.
+	const merged = [...ticks];
+	for (const value of injected) {
+		if (value >= lower && value <= upper && !merged.some((tick) => isSameTick(tick, value))) {
+			merged.push(value);
+		}
+	}
+	return merged.sort((a, b) => a - b);
 }
 
 // --- splitsForTime ---
@@ -608,7 +618,7 @@ export function splitsForTime(options: SplitsForTimeOptions = {}): SplitsFn {
 	const {
 		granularity: rawGranularity = DEFAULT_GRANULARITY,
 		ms: rawMs = DEFAULT_MS,
-		offsetSec = 0,
+		offsetSec: rawOffsetSec = 0,
 		weekStartsOn: rawWeekStartsOn = 0
 	} = options;
 	const warn = makeWarnOnce('splitsForTime');
@@ -639,6 +649,19 @@ export function splitsForTime(options: SplitsForTimeOptions = {}): SplitsFn {
 		rawWeekStartsOn,
 		Number.isInteger(rawWeekStartsOn) && rawWeekStartsOn >= 0 && rawWeekStartsOn <= 6,
 		'a whole number from 0 (Sunday) to 6 (Saturday)',
+		0
+	);
+	// A non-finite offsetSec is the one option knob that can NaN-poison the whole calendar walk:
+	// every getInitialValue divides by or adds it, so a NaN makes the first candidate non-finite,
+	// the walk's finiteness guard stops immediately, and the axis goes blank with no word — the
+	// silent failure this file guards against everywhere else. Any finite offset is legal (it need
+	// not be a whole number of seconds), so only finiteness is checked.
+	const offsetSec = optionOr(
+		warn,
+		'offsetSec',
+		rawOffsetSec,
+		Number.isFinite(rawOffsetSec),
+		'a finite number of seconds',
 		0
 	);
 	const ctx: SplitContext = { offsetSec, weekStartsOn };
@@ -779,11 +802,7 @@ export interface SplitsForLogOptions {
  * ```
  */
 export function splitsForLog(options: SplitsForLogOptions = {}): SplitsFn {
-	const {
-		base: rawBase = DEFAULT_BASE,
-		minor = false,
-		minorMantissas = rawBase === 10 ? [2, 3, 4, 5, 6, 7, 8, 9] : []
-	} = options;
+	const { base: rawBase = DEFAULT_BASE, minor = false, minorMantissas } = options;
 	const warn = makeWarnOnce('splitsForLog');
 	// What is rejected is arithmetic nonsense, not uPlot's `10 | 2`: a base of 1 makes the decade
 	// walk divide by log(1) === 0, and 0 or Infinity make `base ** power` collapse to a single
@@ -798,16 +817,22 @@ export function splitsForLog(options: SplitsForLogOptions = {}): SplitsFn {
 		'a finite number greater than 1',
 		DEFAULT_BASE
 	);
+	// The minor default keys off the *validated* base, not rawBase: an invalid base falls back to
+	// 10, and the 1-2-…-9 default is exactly what a base-10 axis wants, so reading rawBase here
+	// (which would be `!== 10` for the bad value) contradicted the fallback and silently produced a
+	// decade-only axis. An explicit [] is honoured; only an omitted option takes the base default.
 	// Copied, because the array is read on every redraw but supplied once: without this, a caller
 	// who keeps their own reference and mutates it later silently rewrites an already-built axis.
-	const mantissas = [...minorMantissas];
+	const mantissas = [...(minorMantissas ?? (base === 10 ? [2, 3, 4, 5, 6, 7, 8, 9] : []))];
+	// base is fixed at factory time, so its log is too — hoisted out of the per-redraw closure
+	// below, where it was recomputed on every draw.
+	const logBase = Math.log(base);
 
 	return (_self, _axisIdx, scaleMin, scaleMax) => {
 		if (!isTickable(scaleMin, scaleMax) || scaleMin <= 0) {
 			return [];
 		}
 
-		const logBase = Math.log(base);
 		const firstPower = Math.floor(Math.log(scaleMin) / logBase);
 		const lastPower = Math.ceil(Math.log(scaleMax) / logBase);
 

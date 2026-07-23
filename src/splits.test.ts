@@ -187,6 +187,35 @@ describe('splitsForTime', () => {
 		}
 	});
 
+	it('warns once and falls back to a zero offset for a non-finite offsetSec', () => {
+		const warn = vi.spyOn(console, 'warn').mockImplementation(() => {});
+		try {
+			const scaleMin = unixSec('2026-01-01T00:00:00Z');
+			const scaleMax = unixSec('2026-01-06T00:00:00Z');
+			const zeroOffset = splitsForTime({ granularity: 'day' })(
+				fakeSelf(),
+				0,
+				scaleMin,
+				scaleMax,
+				0,
+				0
+			);
+
+			// a non-finite offset is added into every getInitialValue, so left unchecked it makes
+			// the first candidate NaN, the walk stops on its finiteness guard, and the axis blanks
+			// silently — the failure the other option guards exist to prevent
+			for (const offsetSec of [NaN, Infinity, -Infinity]) {
+				expect(
+					splitsForTime({ granularity: 'day', offsetSec })(fakeSelf(), 0, scaleMin, scaleMax, 0, 0)
+				).toEqual(zeroOffset);
+			}
+			expect(warn).toHaveBeenCalledTimes(3); // one per factory, not per redraw
+			expect(warn.mock.calls[0]?.[0]).toContain('offsetSec must be a finite number of seconds');
+		} finally {
+			warn.mockRestore();
+		}
+	});
+
 	it('places coarse boundaries at midnight when the range starts mid-day', () => {
 		// the month/quarter/year rungs build their boundary from a shared scratch Date, so a
 		// range whose start carries a time of day is the case that catches it being reused
@@ -710,6 +739,20 @@ describe('splitsForLog', () => {
 		}
 	});
 
+	it('applies the base-10 minor default after an invalid base falls back to 10', () => {
+		const warn = vi.spyOn(console, 'warn').mockImplementation(() => {});
+		try {
+			// the minor default keys off the validated base, not the raw one: base 1 falls back to
+			// 10, so an omitted minorMantissas must still get the 1-2-…-9 grid a base-10 axis wants,
+			// not the empty [] that reading rawBase (!== 10) would have produced
+			expect(splitsForLog({ base: 1 as 10, minor: true })(fakeSelf(), 0, 1, 10, 0, 0)).toEqual([
+				1, 2, 3, 4, 5, 6, 7, 8, 9, 10
+			]);
+		} finally {
+			warn.mockRestore();
+		}
+	});
+
 	it('does not let a caller mutate minorMantissas after the fact', () => {
 		const mantissas = [5];
 		const splits = splitsForLog({ minor: true, minorMantissas: mantissas });
@@ -1028,6 +1071,18 @@ describe('splitsWithInclude', () => {
 		expect(splitsWithEdges(inner, { mode: 'always' })(fakeSelf(), 0, 40, 60, 0, 0)).toEqual([
 			40, 50, 60
 		]);
+	});
+
+	it('does not emit two injected values that are the same tick a sub-pixel apart', () => {
+		// 0.1 + 0.2 is 0.30000000000000004 — isSameTick to 0.3 but not === it, and near no grid
+		// tick. Deduping injected values only against the base ticks (not against each other) let
+		// both survive the final exact-equality Set, drawing two gridlines a sub-pixel apart.
+		const wrapped = splitsWithInclude(splitsForStep({ step: 10 }), [0.3, 0.1 + 0.2]);
+
+		const result = wrapped(fakeSelf(), 0, 0, 30, 0, 0);
+
+		expect(result.filter((v) => v > 0 && v < 10)).toEqual([0.3]);
+		expect(result).toEqual([0, 0.3, 10, 20, 30]);
 	});
 
 	it('does not let a caller mutate the injected values after the fact', () => {
