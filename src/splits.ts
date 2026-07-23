@@ -208,11 +208,18 @@ function fractionDigits(value: number): number {
 // index math carries for fractional steps (`3 * 0.1 === 0.30000000000000004`). Past 15 digits a
 // double has no precision left to round to, so the value passes through untouched rather than
 // overflowing the 10**digits factor.
+// Every factor roundTo can ask for, resolved once. It runs per tick — a 200-tick axis was paying
+// 200 `10 ** digits` per redraw for a value that only ever takes these 16 forms — and each is
+// exact, since 1e15 is still under 2**53.
+const POW10 = Array.from({ length: 16 }, (_, exponent) => 10 ** exponent);
+
 function roundTo(value: number, digits: number): number {
 	if (digits <= 0 || digits > 15 || !Number.isFinite(value)) {
 		return value;
 	}
-	const factor = 10 ** digits;
+	// `digits` is a whole number in 1..15 here, so the fallback is unreachable — it is how the
+	// lookup is spelled without a non-null assertion under noUncheckedIndexedAccess.
+	const factor = POW10[digits] ?? 10 ** digits;
 	return Math.round(value * factor) / factor;
 }
 
@@ -313,6 +320,21 @@ function stepGrid(
 		firstIndex++;
 	}
 
+	// How long the grid would be is arithmetic, so it is asked rather than discovered. Walking to
+	// find out meant pushing MAX_TICK_CANDIDATES values on every redraw — forever, since the
+	// warning fires once and the zoom does not change — and then handing back that prefix, which
+	// covers the low end of the range and leaves the rest bare. That is the one failure shape
+	// that still looks like a legitimate axis, and wrapping it in splitsWithLimit does not save
+	// it: thinning a prefix just spreads twelve ticks over the half of the plot it reached.
+	// Refusing outright is the same answer this function already gives an unplaceable grid, and
+	// it leaves the caller a real choice — a coarser step, or a narrower range.
+	if (Math.floor((upper - anchor) / step) - firstIndex + 1 > MAX_TICK_CANDIDATES) {
+		into.warn(
+			`the range spans more than ${MAX_TICK_CANDIDATES} ticks at this step — widen the step or narrow the range`
+		);
+		return into.values;
+	}
+
 	for (let k = 0; ; k++) {
 		const raw = gridValue(firstIndex + k);
 		if (!Number.isFinite(raw)) {
@@ -374,9 +396,21 @@ function startOfDay(sec: number, offsetSec: number): number {
 	return Math.floor(shifted / SECONDS_PER_DAY) * SECONDS_PER_DAY - offsetSec;
 }
 
+// One scratch Date shared by the helpers below, which allocated two per tick between them — 400
+// on a 200-year axis, every redraw — while none of them keeps a reference past its own return.
+// This is not module state in the sense invariant #2 forbids: nothing is carried between calls,
+// because every use begins with setTime().
+//
+// The hazard it does introduce is aliasing, and it is a real one: a helper that reads a field off
+// the scratch *after* calling another helper would read the callee's date, not its own. Hence the
+// shape below — every read is pulled into a local before any nested call. Keep that shape when
+// adding to this group.
+const scratchDate = new Date(0);
+
 function startOfWeek(sec: number, offsetSec: number, weekStartsOn: number): number {
 	const dayStart = startOfDay(sec, offsetSec);
-	const dayOfWeek = new Date((dayStart + offsetSec) * 1000).getUTCDay(); // 0 = Sunday
+	scratchDate.setTime((dayStart + offsetSec) * 1000);
+	const dayOfWeek = scratchDate.getUTCDay(); // 0 = Sunday
 	const daysSinceWeekStart = (dayOfWeek - weekStartsOn + 7) % 7;
 	return dayStart - daysSinceWeekStart * SECONDS_PER_DAY;
 }
@@ -385,23 +419,25 @@ function startOfWeek(sec: number, offsetSec: number, weekStartsOn: number): numb
 // correct across the whole Date range. The month is normalised by hand because setUTCFullYear
 // applies the year before the month, so a rolled-over month (e.g. 11 + 3) would otherwise
 // land in the wrong year. An out-of-range input propagates NaN, which the tick walk treats
-// as "stop".
+// as "stop". setTime(0) first, so a scratch left invalid by a previous caller is reset.
 function utcMonthStart(year: number, month: number): number {
-	const date = new Date(0);
-	date.setUTCFullYear(year + Math.floor(month / 12), ((month % 12) + 12) % 12, 1);
-	return date.getTime();
+	scratchDate.setTime(0);
+	scratchDate.setUTCFullYear(year + Math.floor(month / 12), ((month % 12) + 12) % 12, 1);
+	return scratchDate.getTime();
 }
 
 function startOfMonth(sec: number, offsetSec: number, monthDelta = 0): number {
-	const shifted = new Date((sec + offsetSec) * 1000);
-	return (
-		utcMonthStart(shifted.getUTCFullYear(), shifted.getUTCMonth() + monthDelta) / 1000 - offsetSec
-	);
+	scratchDate.setTime((sec + offsetSec) * 1000);
+	// Read out before utcMonthStart overwrites the scratch.
+	const year = scratchDate.getUTCFullYear();
+	const month = scratchDate.getUTCMonth();
+	return utcMonthStart(year, month + monthDelta) / 1000 - offsetSec;
 }
 
 function startOfYear(sec: number, offsetSec: number, yearDelta = 0): number {
-	const shifted = new Date((sec + offsetSec) * 1000);
-	return utcMonthStart(shifted.getUTCFullYear() + yearDelta, 0) / 1000 - offsetSec;
+	scratchDate.setTime((sec + offsetSec) * 1000);
+	const year = scratchDate.getUTCFullYear();
+	return utcMonthStart(year + yearDelta, 0) / 1000 - offsetSec;
 }
 
 /**
@@ -641,13 +677,21 @@ export function splitsForTime(options: SplitsForTimeOptions = {}): SplitsFn {
 			makeCollector(warn)
 		);
 
-		return normalize(
-			// Scaling back is a no-op on a seconds axis, so the default path keeps the walk's
-			// own array instead of paying for a copy of it every redraw.
-			unitsPerSec === 1 ? ticks : ticks.map((value) => value * unitsPerSec),
-			scaleMin,
-			scaleMax
-		);
+		// Not normalize(): the walk is strictly ascending and unique by construction, so its
+		// dedupe and sort are dead work, and the only part that isn't — the lower clamp — is one
+		// comparison. The clamp is genuinely needed, and for more than the first value: a rung
+		// starts at the boundary at or before scaleMin, and a coarse one can take several steps
+		// to reach it (a quarter rung entering a range in November walks Jan, Apr, Jul, Oct
+		// first). The upper end needs nothing, the walk having already stopped at maxSec.
+		//
+		// Scaling by 1 is exact, so the seconds path costs nothing for sharing this loop.
+		const result: number[] = [];
+		for (const value of ticks) {
+			if (value >= minSec) {
+				result.push(value * unitsPerSec);
+			}
+		}
+		return result;
 	};
 }
 

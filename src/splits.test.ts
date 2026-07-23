@@ -187,6 +187,23 @@ describe('splitsForTime', () => {
 		}
 	});
 
+	it('places coarse boundaries at midnight when the range starts mid-day', () => {
+		// the month/quarter/year rungs build their boundary from a shared scratch Date, so a
+		// range whose start carries a time of day is the case that catches it being reused
+		// without a reset — the boundary would inherit 00:00:37 from the range instead of
+		// starting the month. Every other test here starts exactly on midnight and cannot see it.
+		const odd = unixSec('2026-01-01T00:00:37Z');
+
+		for (const granularity of ['month', 'quarter', 'year'] as const) {
+			const result = splitsForTime({ granularity })(fakeSelf(), 0, odd, odd + 400 * 86400, 0, 0);
+
+			expect(result.length).toBeGreaterThan(0);
+			for (const value of result) {
+				expect(value % 86400).toBe(0);
+			}
+		}
+	});
+
 	it('ticks quarter starts, not arbitrary three-month offsets', () => {
 		const splits = splitsForTime({ granularity: 'quarter' });
 		// starts mid-quarter, so a rung that stepped from scaleMin instead of the year start
@@ -794,10 +811,34 @@ describe('splitsForStep', () => {
 		try {
 			const splits = splitsForStep({ step: 1e-9 });
 
-			const result = splits(fakeSelf(), 0, 0, 1, 0, 0);
+			// the range holds 1e9 steps. It is refused outright rather than truncated to the
+			// cap's worth: a prefix covers the low end and leaves the rest of the axis bare,
+			// which reads as a legitimate result, and no amount of splitsWithLimit on top
+			// recovers the part that was never generated
+			expect(splits(fakeSelf(), 0, 0, 1, 0, 0)).toEqual([]);
+			expect(warn).toHaveBeenCalledOnce();
+			expect(warn.mock.calls[0]?.[0]).toContain('widen the step or narrow the range');
 
-			// the range holds 1e9 steps; the walk bails far short of that, once, loudly
-			expect(result.length).toBeLessThan(1e9);
+			// and the count is arithmetic, so this costs the same whether the range wants
+			// ten thousand ticks or a billion
+			expect(splits(fakeSelf(), 0, 0, 1e6, 0, 0)).toEqual([]);
+		} finally {
+			warn.mockRestore();
+		}
+	});
+
+	it('refuses exactly at the tick ceiling, not approximately', () => {
+		const warn = vi.spyOn(console, 'warn').mockImplementation(() => {});
+		try {
+			// the count is derived arithmetically rather than by walking, so it has to land on the
+			// same boundary the walk would have: one tick under the ceiling still renders
+			const splits = splitsForStep({ step: 1 });
+
+			expect(splits(fakeSelf(), 0, 0, 9998, 0, 0).length).toBe(9999);
+			expect(splits(fakeSelf(), 0, 0, 9999, 0, 0).length).toBe(10_000);
+			expect(warn).not.toHaveBeenCalled();
+
+			expect(splits(fakeSelf(), 0, 0, 10_000, 0, 0)).toEqual([]);
 			expect(warn).toHaveBeenCalledOnce();
 		} finally {
 			warn.mockRestore();
@@ -810,13 +851,16 @@ describe('splitsForStep', () => {
 			const splits = splitsForStep({ step: 1e-9 });
 
 			// the two conditions are unrelated — an unplaceable grid is fixed by changing the
-			// options, a capped walk by changing the range — so silencing one must not silence
-			// the other on the same factory instance
+			// options, a range too dense for the step by changing the range — so silencing one
+			// must not silence the other on the same factory instance. Both refuse, so the
+			// return value cannot tell them apart; only the message can
 			expect(splits(fakeSelf(), 0, 1.7e9, 1.7e9 + 1, 0, 0)).toEqual([]);
 			expect(warn).toHaveBeenCalledOnce();
+			expect(warn.mock.calls[0]?.[0]).toContain('too small to place an exact tick grid');
 
-			expect(splits(fakeSelf(), 0, 0, 1, 0, 0).length).toBeGreaterThan(0);
+			expect(splits(fakeSelf(), 0, 0, 1, 0, 0)).toEqual([]);
 			expect(warn).toHaveBeenCalledTimes(2);
+			expect(warn.mock.calls[1]?.[0]).toContain('widen the step or narrow the range');
 
 			// but a repeat of either condition still stays quiet, per redraw
 			splits(fakeSelf(), 0, 0, 1, 0, 0);
