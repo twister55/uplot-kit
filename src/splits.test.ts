@@ -944,6 +944,20 @@ describe('splitsForStep', () => {
 		expect(splitsForStep({ step: 0.1 })(fakeSelf(), 0, 0, 0.95, 0, 0).at(-1)).toBe(0.9);
 	});
 
+	it('keeps an edge tick whose bound drifted a few ulps, not just one', () => {
+		// a padded scaleMax can reach the comparison more than one ulp off the grid point it means
+		// to include. 27 * 0.089 is 2.403; a bound ~2 ulps below (2.402999999999999) dropped that
+		// tick under a one-ulp window. The four-ulp window keeps it — still sub-pixel.
+		const step = 0.089;
+		expect(splitsForStep({ step })(fakeSelf(), 0, 2.4, 2.402999999999999, 0, 0)).toEqual([
+			27 * step
+		]);
+
+		// but a bound genuinely further out (~5 ulps) is still past the end, so the window is not a
+		// blank cheque
+		expect(splitsForStep({ step })(fakeSelf(), 0, 2.4, 2.402999999999998, 0, 0)).toEqual([]);
+	});
+
 	it('never emits negative zero for a grid phased across the origin', () => {
 		// 0.3 + (-3) * 0.1 is -5.55e-17, which rounds to `-0` and formats as "-0" through
 		// Intl — the tick the caller means is 0
@@ -986,18 +1000,20 @@ describe('splitsForStep', () => {
 		}
 	});
 
-	it('refuses exactly at the tick ceiling, not approximately', () => {
+	it('refuses at the tick ceiling, conservative by one for the isSameTick boundary', () => {
 		const warn = vi.spyOn(console, 'warn').mockImplementation(() => {});
 		try {
-			// the count is derived arithmetically rather than by walking, so it has to land on the
-			// same boundary the walk would have: one tick under the ceiling still renders
+			// the count is derived arithmetically rather than by walking, and the walk can emit one
+			// index past the arithmetic floor when a point sits an ulp above `upper` yet on it — so
+			// the refusal is made conservative by that one: a grid of 9999 ticks still renders, and
+			// one of exactly MAX_TICK_CANDIDATES (10000) refuses rather than risk the bypass
 			const splits = splitsForStep({ step: 1 });
 
+			expect(splits(fakeSelf(), 0, 0, 9997, 0, 0).length).toBe(9998);
 			expect(splits(fakeSelf(), 0, 0, 9998, 0, 0).length).toBe(9999);
-			expect(splits(fakeSelf(), 0, 0, 9999, 0, 0).length).toBe(10_000);
 			expect(warn).not.toHaveBeenCalled();
 
-			expect(splits(fakeSelf(), 0, 0, 10_000, 0, 0)).toEqual([]);
+			expect(splits(fakeSelf(), 0, 0, 9999, 0, 0)).toEqual([]);
 			expect(warn).toHaveBeenCalledOnce();
 		} finally {
 			warn.mockRestore();

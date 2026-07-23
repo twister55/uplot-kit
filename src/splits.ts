@@ -190,6 +190,13 @@ function roundGridValue(value: number, digits: number): number {
 	return digits > 15 ? roundSignificant(value) : roundTo(value, digits);
 }
 
+// The window, in relative ulps, within which two doubles are treated as the same axis position.
+// A single differently-associated product drifts by one ulp, but a scale bound can reach the
+// comparison having accumulated several through uPlot's own range padding, and a one-ulp window
+// dropped an edge tick that sat that far out. Four ulps still resolves to a sub-pixel distance on
+// any real axis while absorbing that drift.
+const SAME_TICK_ULPS = 4;
+
 // Whether two doubles denote the same axis position. They routinely do not compare equal while
 // meaning the same thing, because the same quantity reached them by different arithmetic: a grid
 // point computed as `27 * 0.089` is 2.403, while the bound reached as `7 * 0.089 + 20 * 0.089` is
@@ -198,10 +205,10 @@ function roundGridValue(value: number, digits: number): number {
 // stepGrid to tell a tick sitting *on* a bound from one past it, mergeTicks to keep an injected
 // edge from being drawn a sub-pixel away from the tick it duplicates.
 //
-// The tolerance is a relative ulp, so it scales with magnitude and collapses to exact equality
-// at zero — which is right, since there is no relative error to allow for around zero.
+// The tolerance is relative, so it scales with magnitude and collapses to exact equality at zero —
+// which is right, since there is no relative error to allow for around zero.
 function isSameTick(a: number, b: number): boolean {
-	return Math.abs(a - b) <= Math.max(Math.abs(a), Math.abs(b)) * Number.EPSILON;
+	return Math.abs(a - b) <= Math.max(Math.abs(a), Math.abs(b)) * (SAME_TICK_ULPS * Number.EPSILON);
 }
 
 // The arithmetic tick grid `anchor + k * step`, clamped to [lower, upper] — the shared body of
@@ -280,7 +287,16 @@ function stepGrid(
 	// it: thinning a prefix just spreads twelve ticks over the half of the plot it reached.
 	// Refusing outright is the same answer this function already gives an unplaceable grid, and
 	// it leaves the caller a real choice — a coarser step, or a narrower range.
-	if (Math.floor((upper - anchor) / step) - firstIndex + 1 > MAX_TICK_CANDIDATES) {
+	//
+	// The count is `floor((upper - anchor) / step)` for the last index, but the loop's own upper
+	// test uses isSameTick, so it can emit one index *past* that floor when the point sits an ulp
+	// above `upper` yet on it — a case this arithmetic can't see. So the estimate is treated as
+	// exact-to-within-one and the check is made conservative by that one (`+ 2`, not `+ 1`):
+	// without it a grid of exactly MAX_TICK_CANDIDATES + 1 slipped past here, then hit the
+	// collector cap and handed back the truncated prefix this refusal exists to avoid. The cost is
+	// that a legitimate grid of exactly MAX_TICK_CANDIDATES ticks is also refused — but that many
+	// ticks is already past any usable density, so refusing one sooner changes only the message.
+	if (Math.floor((upper - anchor) / step) - firstIndex + 2 > MAX_TICK_CANDIDATES) {
 		into.warn(
 			`the range spans more than ${MAX_TICK_CANDIDATES} ticks at this step — ` +
 				'widen the step or narrow the range'
@@ -719,17 +735,23 @@ export function splitsForTime(options: SplitsForTimeOptions = {}): SplitsFn {
 		// Walk the calendar boundaries: start at the rung's boundary at or before minSec and
 		// advance by its own irregular step until past maxSec. The arithmetic generators go
 		// through stepGrid() instead, whose even step is drift-free; a calendar step is not, so
-		// it is walked rather than indexed. The collector caps a walk that a degenerate range
-		// would otherwise run unbounded.
-		const collector = makeCollector(warn);
+		// it is walked rather than indexed.
+		//
+		// What bounds this walk is the finiteness guard alone, not the MAX_TICK_CANDIDATES cap the
+		// arithmetic generators share: getNextValue's Date math returns NaN once a value passes the
+		// ±271821-year edge of Date's own range, and every current rung reaches that within a few
+		// thousand steps of an absurd range — the coarsest steps a century, so Date overflows long
+		// before 10000 finite candidates could accumulate. The cap would therefore be dead code
+		// here, so it is deliberately left out. The one thing that would revive the need for it is a
+		// rung finer than a day — an 'hour' or 'minute' granularity, which could emit 10000 finite
+		// candidates over a perfectly valid Date range — so adding one means adding a cap here too.
+		const boundaries: number[] = [];
 		for (
 			let value = level.getInitialValue(minSec, ctx);
 			Number.isFinite(value) && value <= maxSec;
 			value = level.getNextValue(value, ctx)
 		) {
-			if (!collector.push(value)) {
-				break;
-			}
+			boundaries.push(value);
 		}
 
 		// Not normalize(): the walk is strictly ascending and unique by construction, so its
@@ -741,7 +763,7 @@ export function splitsForTime(options: SplitsForTimeOptions = {}): SplitsFn {
 		//
 		// Scaling by 1 is exact, so the seconds path costs nothing for sharing this loop.
 		const result: number[] = [];
-		for (const value of collector.values) {
+		for (const value of boundaries) {
 			if (value >= minSec) {
 				result.push(value * unitsPerSec);
 			}
