@@ -176,6 +176,20 @@ function roundSignificant(value: number): number {
 	return Number.isFinite(value) ? Number(value.toPrecision(SIGNIFICANT_DIGITS)) : value;
 }
 
+// The rounding stepGrid applies to a raw grid value. Decimal-place rounding (roundTo) is the right
+// tool for an ordinary fractional step — it is exact and recovers the decimal the caller wrote
+// (`3 * 0.1` back to `0.3`) — but it gives up once `digits` exceeds 15, and a step or anchor whose
+// own shortest decimal is longer than that reaches exactly there: `1/3` is "0.3333333333333333"
+// (16 digits), `0.1 + 0.2` is "0.30000000000000004" (17), and any step at a magnitude below ~1e-15
+// needs more decimals than a double carries. Left to roundTo alone the whole grid then came out in
+// float noise (a clean `0.1` step under a noisy anchor emitting `0.6000000000000001`). Past that
+// threshold this falls back to significant-digit rounding — the same scale-free rule splitsForLog
+// already uses to clean both magnitude ends with one pass. Below the threshold roundTo is unchanged,
+// so no ordinary grid rounds differently.
+function roundGridValue(value: number, digits: number): number {
+	return digits > 15 ? roundSignificant(value) : roundTo(value, digits);
+}
+
 // Whether two doubles denote the same axis position. They routinely do not compare equal while
 // meaning the same thing, because the same quantity reached them by different arithmetic: a grid
 // point computed as `27 * 0.089` is 2.403, while the bound reached as `7 * 0.089 + 20 * 0.089` is
@@ -243,7 +257,7 @@ function stepGrid(
 	const gridValue = (index: number): number => anchor + index * step;
 	const isAtOrAbove = (index: number): boolean => {
 		const raw = gridValue(index);
-		const nearest = Math.max(raw, roundTo(raw, digits));
+		const nearest = Math.max(raw, roundGridValue(raw, digits));
 		return nearest >= lower || isSameTick(nearest, lower);
 	};
 
@@ -279,7 +293,7 @@ function stepGrid(
 		if (!Number.isFinite(raw)) {
 			break;
 		}
-		const value = roundTo(raw, digits);
+		const value = roundGridValue(raw, digits);
 		const nearest = Math.min(raw, value);
 		if (nearest > upper && !isSameTick(nearest, upper)) {
 			break;
@@ -835,6 +849,21 @@ export function splitsForLog(options: SplitsForLogOptions = {}): SplitsFn {
 
 		const firstPower = Math.floor(Math.log(scaleMin) / logBase);
 		const lastPower = Math.ceil(Math.log(scaleMax) / logBase);
+
+		// How many decades the sweep would visit is arithmetic, so it is asked before walking, the
+		// same way stepGrid asks its tick count. A base near 1 (the guard admits any base > 1) makes
+		// a decade a hair wide, so an ordinary range spans tens of thousands of them: the walk would
+		// then push ~10000 near-identical ticks into a sliver of the axis and fire the candidate cap,
+		// handing back a low-end prefix that still looks like a real axis — the failure stepGrid
+		// refuses rather than truncates. Refuse on the same rule. A base of 2 or 10 spans at most
+		// ~2100 decades across the entire double range, so this only ever bites a pathological base.
+		if (lastPower - firstPower + 1 > MAX_TICK_CANDIDATES) {
+			warn(
+				`the range spans more than ${MAX_TICK_CANDIDATES} decades at base ${base} — ` +
+					'use a base further from 1, or narrow the range'
+			);
+			return [];
+		}
 
 		const collector = makeCollector(warn);
 		for (let power = firstPower; power <= lastPower; power++) {

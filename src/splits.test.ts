@@ -753,6 +753,20 @@ describe('splitsForLog', () => {
 		}
 	});
 
+	it('refuses cleanly for a base so close to 1 the range spans too many decades', () => {
+		const warn = vi.spyOn(console, 'warn').mockImplementation(() => {});
+		try {
+			// base 1.0001 passes the > 1 guard but makes [1, 10] span ~23000 decades; the sweep must
+			// refuse outright with a clear message, not walk to the candidate cap and hand back a
+			// dense low-end prefix that still looks like a real axis
+			expect(splitsForLog({ base: 1.0001 as 10 })(fakeSelf(), 0, 1, 10, 0, 0)).toEqual([]);
+			expect(warn).toHaveBeenCalledOnce();
+			expect(warn.mock.calls[0]?.[0]).toContain('more than 10000 decades at base 1.0001');
+		} finally {
+			warn.mockRestore();
+		}
+	});
+
 	it('does not let a caller mutate minorMantissas after the fact', () => {
 		const mantissas = [5];
 		const splits = splitsForLog({ minor: true, minorMantissas: mantissas });
@@ -1042,6 +1056,27 @@ describe('splitsForStep', () => {
 		for (const value of result) {
 			expect((value - anchor) % 900).toBe(0);
 		}
+	});
+
+	it('cleans float noise when the anchor carries more than 15 fractional digits', () => {
+		// a clean 0.1 step under a noisy anchor — 0.1 + 0.2 is 0.30000000000000004, 17 fractional
+		// digits — used to push the grid's rounding past its 15-digit ceiling and disable it for
+		// every tick, so a plain 0.6 came out as 0.6000000000000001. Significant-digit rounding
+		// recovers the decimals the caller wrote.
+		const splits = splitsForStep({ step: 0.1, anchor: 0.1 + 0.2 });
+
+		expect(splits(fakeSelf(), 0, 0.25, 0.75, 0, 0)).toEqual([0.3, 0.4, 0.5, 0.6, 0.7]);
+	});
+
+	it('cleans float noise on a sub-1e-15-magnitude grid decimals cannot round', () => {
+		// below 1e-15 a double has more decimals than it can carry, so decimal rounding cannot help
+		// at all; significant-digit rounding is scale-free and cleans it. 3 * 7e-16 is
+		// 2.1000000000000002e-15 raw — the tick decimal rounding would leave noisy
+		const splits = splitsForStep({ step: 7e-16 });
+
+		expect(splits(fakeSelf(), 0, 0, 3.5e-15, 0, 0)).toEqual([
+			0, 7e-16, 1.4e-15, 2.1e-15, 2.8e-15, 3.5e-15
+		]);
 	});
 });
 
