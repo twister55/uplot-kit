@@ -433,10 +433,24 @@ function everyNDays(n: number): RungStep {
 	};
 }
 
-// Every `n`-th week from the week boundary `weekStartsOn` selects. n = 1 is a plain week.
+// Every `n`-th week from the week boundary `weekStartsOn` selects, phased to a fixed origin (the
+// weekly grid through the epoch) so a 2-week rung lands on the same weeks no matter where the
+// window sits — the same fixed-origin property everyNDays gets by counting day indices from the
+// epoch. Phasing to `startOfWeek(scaleMin)` instead tied the parity to scaleMin's own week, so a
+// one-week pan slid every 2-week tick. n = 1 is a plain week, for which the phase is a no-op.
 function everyNWeeks(n: number): RungStep {
 	return {
-		getInitialValue: (scaleMin, ctx) => startOfWeek(scaleMin, ctx.offsetSec, ctx.weekStartsOn),
+		getInitialValue: (scaleMin, ctx) => {
+			const weekStart = startOfWeek(scaleMin, ctx.offsetSec, ctx.weekStartsOn);
+			// referenceWeek and weekStart are both boundaries on the same weekly grid, so their
+			// difference is an exact multiple of a week; Math.round only clears the division's
+			// float dust. Ceiling the index to a multiple of n mirrors everyNDays exactly, and for
+			// n = 1 collapses back to weekStart (the boundary at or before scaleMin).
+			const referenceWeek = startOfWeek(0, ctx.offsetSec, ctx.weekStartsOn);
+			const weekIndex = Math.round((weekStart - referenceWeek) / SECONDS_PER_WEEK);
+			const aligned = Math.ceil(weekIndex / n) * n;
+			return referenceWeek + aligned * SECONDS_PER_WEEK;
+		},
 		getNextValue: (currentValue) => currentValue + n * SECONDS_PER_WEEK
 	};
 }

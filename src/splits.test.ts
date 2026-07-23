@@ -263,6 +263,34 @@ describe('splitsForTime', () => {
 		expect(shifted.map((v) => new Date(v * 1000).getUTCDate())).toEqual([3, 5, 7, 9, 11, 13]);
 	});
 
+	it('phases the 2-week rung to a fixed origin so a one-week pan does not slide it', () => {
+		const splits = splitsForTime({ granularity: 'week' });
+		const DAY = 86400;
+		// 70 days lands on the every-2-weeks rung (55 < days <= 110); the parity of which weeks
+		// tick must come from a fixed origin, not from whichever week scaleMin happens to fall in
+		const span = 70 * DAY;
+		const aStart = unixSec('2026-01-04T00:00:00Z'); // a Sunday
+		const bStart = unixSec('2026-01-11T00:00:00Z'); // panned exactly one week
+
+		const a = splits(fakeSelf(), 0, aStart, aStart + span, 0, 0);
+		const b = splits(fakeSelf(), 0, bStart, bStart + span, 0, 0);
+
+		// both windows must agree on every tick in their overlap — the defining property of a
+		// fixed-origin grid. Before the fix the 2-week parity was tied to scaleMin's own week, so
+		// the two windows interleaved (Jan 4/18/Feb 1 … vs Jan 11/25/Feb 8 …) instead of coinciding
+		const overlap = (ticks: number[]) => ticks.filter((v) => v >= bStart && v <= aStart + span);
+		expect(overlap(a).length).toBeGreaterThan(0);
+		expect(overlap(b)).toEqual(overlap(a));
+
+		// every tick is a Sunday, exactly two weeks apart (reduce, not indexing, to stay within
+		// noUncheckedIndexedAccess — and a is non-empty since its overlap is)
+		expect(a.every((v) => new Date(v * 1000).getUTCDay() === 0)).toBe(true);
+		a.reduce((previous, current) => {
+			expect(current - previous).toBe(14 * DAY);
+			return current;
+		});
+	});
+
 	it('keeps widening past a few years into decades and centuries', () => {
 		const splits = splitsForTime({ granularity: 'year' });
 
@@ -347,6 +375,10 @@ describe('splitsForTime', () => {
 
 		const result = splits(fakeSelf(), 0, scaleMin, scaleMax, 0, 0);
 
+		// guard first: a per-element loop over an empty array is vacuously green, so this would
+		// pass even if the generator regressed to returning nothing. A 9-day range is past the
+		// daily rung's 8-day limit, so it ticks the 2-day rung (Mar 2/4/6/8/10 = 5)
+		expect(result.length).toBe(5);
 		for (const value of result) {
 			expect(value).toBeGreaterThanOrEqual(scaleMin);
 			expect(value).toBeLessThanOrEqual(scaleMax);
@@ -387,6 +419,9 @@ describe('splitsForTime', () => {
 
 		const result = splits(fakeSelf(), 0, scaleMin, scaleMax, 86400, 60);
 
+		// guard first: without it the two not.toContain / the loop are all vacuously green on an
+		// empty result (four midnights, Jan 2..5, fall inside)
+		expect(result.length).toBe(4);
 		// the raw edges must NOT appear as ticks; only clean midnights do
 		expect(result).not.toContain(scaleMin);
 		expect(result).not.toContain(scaleMax);
