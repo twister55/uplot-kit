@@ -1329,6 +1329,13 @@ export function splitsForCategory(options: SplitsForCategoryOptions = {}): Split
  * threshold must stay visible while the user zooms. The inner function's own ticks are passed
  * through as it emitted them.
  *
+ * The clamp is to the visible range `[scaleMin, scaleMax]` only, not to any narrower domain the
+ * inner generator enforces for its *own* ticks. On a `splitsForCategory({ count })` axis whose
+ * scale runs wider than the data, an injected value in the padding past the last category (an
+ * index `>= count`) is kept as given — `splitsForCategory` clamps only the ticks it generates, not
+ * the ones you inject. Pin the scale to the category range (`scales.x.range: [0, count - 1]`), or
+ * don't inject out-of-domain indices, if a stray tick beyond the last category would mislead.
+ *
  * `values` is read on every redraw but copied once, so mutating the array afterwards does not
  * change an axis already built from it.
  *
