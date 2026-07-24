@@ -611,6 +611,24 @@ describe('splitsForTime', () => {
 		expect(result[0]).toBe(0);
 		expect(result.some((value) => Object.is(value, -0))).toBe(false);
 	});
+
+	it('caps the day/week calendar walk instead of hanging on a pathological offsetSec', () => {
+		const warn = vi.spyOn(console, 'warn').mockImplementation(() => {});
+		try {
+			// everyNDays is pure number addition (never touches Date, so no NaN-overflow bound):
+			// a huge finite offsetSec decouples the walk start from maxSec via catastrophic
+			// cancellation in `scaleMin + offsetSec`, and only MAX_TICK_CANDIDATES bounds it.
+			const splits = splitsForTime({ granularity: 'day', offsetSec: 1e28 });
+
+			const result = splits(fakeSelf(), 0, 1e12, 1e12 + 30 * 86400, 0, 0);
+
+			expect(result.length).toBeLessThanOrEqual(10_000);
+			expect(warn).toHaveBeenCalledOnce();
+			expect(warn.mock.calls[0]?.[0]).toContain('tick candidates');
+		} finally {
+			warn.mockRestore();
+		}
+	});
 });
 
 describe('splitsForLog', () => {

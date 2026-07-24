@@ -750,22 +750,28 @@ export function splitsForTime(options: SplitsForTimeOptions = {}): SplitsFn {
 		// through stepGrid() instead, whose even step is drift-free; a calendar step is not, so
 		// it is walked rather than indexed.
 		//
-		// What bounds this walk is the finiteness guard alone, not the MAX_TICK_CANDIDATES cap the
-		// arithmetic generators share: getNextValue's Date math returns NaN once a value passes the
-		// ±271821-year edge of Date's own range, and every current rung reaches that within a few
-		// thousand steps of an absurd range — the coarsest steps a century, so Date overflows long
-		// before 10000 finite candidates could accumulate. The cap would therefore be dead code
-		// here, so it is deliberately left out. The one thing that would revive the need for it is a
-		// rung finer than a day — an 'hour' or 'minute' granularity, which could emit 10000 finite
-		// candidates over a perfectly valid Date range — so adding one means adding a cap here too.
-		const boundaries: number[] = [];
+		// The walk shares the same MAX_TICK_CANDIDATES cap as the arithmetic generators. The
+		// finiteness guard alone is not enough: it was thought to be, on the reasoning that
+		// getNextValue's Date math returns NaN past the ±271821-year edge of Date's range within a
+		// few thousand steps — but that only holds for the month/year rungs, which round-trip
+		// through Date. everyNDays/everyNWeeks are pure number addition and never touch Date, so a
+		// large-but-finite offsetSec can, through catastrophic cancellation in `scaleMin +
+		// offsetSec`, decouple the start from maxSec and leave the finiteness guard walking millions
+		// of finite day-steps on every redraw. The cap turns that into a bounded walk with one loud
+		// warning, exactly as it does for a degenerate arithmetic grid. (A rung finer than a day —
+		// an 'hour'/'minute' granularity — would emit 10000 finite candidates over a perfectly valid
+		// range and needs the cap for that ordinary reason too.)
+		const collector = makeCollector(warn);
 		for (
 			let value = level.getInitialValue(minSec, ctx);
 			Number.isFinite(value) && value <= maxSec;
 			value = level.getNextValue(value, ctx)
 		) {
-			boundaries.push(value);
+			if (!collector.push(value)) {
+				break;
+			}
 		}
+		const boundaries = collector.values;
 
 		// Not normalize(): the walk is strictly ascending and unique by construction, so its
 		// dedupe and sort are dead work, and the only part that isn't — the lower clamp — is one
