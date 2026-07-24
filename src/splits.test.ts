@@ -612,6 +612,48 @@ describe('splitsForTime', () => {
 		expect(result.some((value) => Object.is(value, -0))).toBe(false);
 	});
 
+	it('warns instead of silently blanking on a unit-mismatched (e.g. nanosecond) axis', () => {
+		const warn = vi.spyOn(console, 'warn').mockImplementation(() => {});
+		try {
+			// nanosecond-scale timestamps read against the seconds default sit ~1e21 ms from the
+			// epoch, past Date's range: the calendar math NaNs and the walk stops at zero iterations
+			const result = splitsForTime({ granularity: 'day' })(
+				fakeSelf(),
+				0,
+				1.77e18,
+				1.77e18 + 1e9,
+				0,
+				0
+			);
+
+			expect(result).toEqual([]);
+			expect(warn).toHaveBeenCalledOnce();
+			expect(warn.mock.calls[0]?.[0]).toContain('ms');
+		} finally {
+			warn.mockRestore();
+		}
+	});
+
+	it('stays silent on a legitimately empty window (intraday zoom, not a unit mismatch)', () => {
+		const warn = vi.spyOn(console, 'warn').mockImplementation(() => {});
+		try {
+			const start = Date.UTC(2026, 0, 5, 6, 0) / 1000; // 06:00 — no midnight in a 3h zoom
+			const result = splitsForTime({ granularity: 'day' })(
+				fakeSelf(),
+				0,
+				start,
+				start + 3 * 3600,
+				0,
+				0
+			);
+
+			expect(result).toEqual([]);
+			expect(warn).not.toHaveBeenCalled();
+		} finally {
+			warn.mockRestore();
+		}
+	});
+
 	it('caps the day/week calendar walk instead of hanging on a pathological offsetSec', () => {
 		const warn = vi.spyOn(console, 'warn').mockImplementation(() => {});
 		try {

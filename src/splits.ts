@@ -761,9 +761,28 @@ export function splitsForTime(options: SplitsForTimeOptions = {}): SplitsFn {
 		// warning, exactly as it does for a degenerate arithmetic grid. (A rung finer than a day —
 		// an 'hour'/'minute' granularity — would emit 10000 finite candidates over a perfectly valid
 		// range and needs the cap for that ordinary reason too.)
+		// A non-finite *first* boundary is the one empty result that is not a legitimate "no
+		// boundary in this window". It means the rung's Date math produced NaN — which happens
+		// when minSec sits past the ±271821-year edge of Date's range, and the overwhelmingly
+		// common way to land there is a unit mismatch: nanosecond (or microsecond) timestamps read
+		// against the seconds/ms `ms` default sit ~1000x too far from the epoch. Left alone the
+		// walk stops at zero iterations and the axis goes blank with no word — the silent failure
+		// this file warns against everywhere else. An intraday zoom, by contrast, yields a *finite*
+		// first boundary that merely falls outside [minSec, maxSec]; that stays silent, as its
+		// documented remedy is splitsWithEdges, not a fix to the input.
+		const firstBoundary = level.getInitialValue(minSec, ctx);
+		if (!Number.isFinite(firstBoundary)) {
+			warn(
+				'the visible range maps to no finite calendar boundary — timestamps this far from ' +
+					'the epoch usually mean the axis is in a finer unit than ms declares (pass the ' +
+					'same ms you passed uPlot, e.g. ms: 1 for millisecond timestamps)'
+			);
+			return [];
+		}
+
 		const collector = makeCollector(warn);
 		for (
-			let value = level.getInitialValue(minSec, ctx);
+			let value = firstBoundary;
 			Number.isFinite(value) && value <= maxSec;
 			value = level.getNextValue(value, ctx)
 		) {
