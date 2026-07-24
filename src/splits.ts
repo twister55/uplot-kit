@@ -1336,6 +1336,12 @@ export function splitsForCategory(options: SplitsForCategoryOptions = {}): Split
  * the ones you inject. Pin the scale to the category range (`scales.x.range: [0, count - 1]`), or
  * don't inject out-of-domain indices, if a stray tick beyond the last category would mislead.
  *
+ * The injected values are only guaranteed when no *outer* decorator removes ticks: a
+ * {@link splitsWithFilter} or {@link splitsWithLimit} wrapped around this one can drop an injected
+ * value, since neither knows the tick was meant to be kept. Wrap those **inside** this decorator
+ * (`splitsWithInclude(splitsWithFilter(inner, keep), [t])`) so they only ever see the generator's
+ * own ticks — see the notes on {@link splitsWithFilter} and {@link splitsWithLimit}.
+ *
  * `values` is read on every redraw but copied once, so mutating the array afterwards does not
  * change an axis already built from it.
  *
@@ -1389,6 +1395,18 @@ export function splitsWithInclude(inner: SplitsFn, values: number[]): SplitsFn {
  * `null` a JS caller passes for the same reason — means the limit is unknown, not that nothing
  * fits, and passes the inner ticks through, as does an explicit `Infinity`. A value below one —
  * `-Infinity` and zero included — yields no ticks.
+ *
+ * Thinning is **positional** — it keeps every k-th entry and has no notion of which ticks a
+ * wrapped {@link splitsWithInclude} or {@link splitsWithEdges} guaranteed, so a "must-show"
+ * threshold or range edge can be thinned away like any other tick (and, since k shifts with the
+ * tick count, it may drop on one zoom and survive the next). There is no wrap order that satisfies
+ * both this decorator's limit and an injecting decorator's guarantee at once: wrap `splitsWithLimit`
+ * **outside** the injector — `splitsWithLimit(splitsWithInclude(inner, [t]), n)` — and `maxTicks` is
+ * honoured but the injected `t` may be thinned out; wrap it **inside** —
+ * `splitsWithInclude(splitsWithLimit(inner, n), [t])` — and `t` is guaranteed but the injected/edge
+ * ticks are added on top of the thinned set, so the result can exceed `maxTicks`. Choose by which
+ * guarantee matters more; if both must hold, keep the injected values out of the thinned set by
+ * some other means (e.g. a scale range pinned so the edge is a real tick the generator emits).
  *
  * @example
  * ```ts
@@ -1458,6 +1476,14 @@ export function splitsWithLimit(inner: SplitsFn, maxTicks: number): SplitsFn {
  * them through `keep`, so on a window the filter empties (a weekend-only zoom, say) the
  * fallback puts back exactly the ticks the filter removed. Wrapping the other way,
  * `splitsWithFilter(splitsWithEdges(inner), keep)`, filters the edges too.
+ *
+ * The opposite order is right for {@link splitsWithInclude}: wrap this **inside** it, not outside.
+ * `splitsWithFilter(splitsWithInclude(inner, [t]), keep)` runs `keep` over the injected `t` too, so
+ * a `t` that fails the predicate is silently dropped every redraw — the guarantee `splitsWithInclude`
+ * exists to make, gone. Wrap the other way, `splitsWithInclude(splitsWithFilter(inner, keep), [t])`,
+ * and the filter only ever sees the generator's own ticks while `t` is injected afterward, kept
+ * unconditionally. In short: a filter belongs between the generator and any decorator that
+ * guarantees a tick, never on top of one.
  *
  * @example
  * ```ts
