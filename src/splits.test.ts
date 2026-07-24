@@ -1240,6 +1240,14 @@ describe('splitsWithInclude', () => {
 		expect(result).toEqual([10, 20, 25, 30, 40, 50]);
 	});
 
+	it('injects nothing on an inverted range, passing the inner ticks through', () => {
+		// isTickable rejects scaleMin > scaleMax the same way the generators do — an injected value
+		// cannot fall inside an empty interval — so the inner ticks pass through unchanged
+		const result = splitsWithInclude(() => [1, 2, 3], [1.5, 100])(fakeSelf(), 0, 10, 5, 0, 0);
+
+		expect(result).toEqual([1, 2, 3]);
+	});
+
 	it('does not let a caller mutate the injected values after the fact', () => {
 		const thresholds = [25];
 		const wrapped = splitsWithInclude(splitsForStep({ step: 10 }), thresholds);
@@ -1546,6 +1554,14 @@ describe('splitsWithEdges', () => {
 		const wrapped = splitsWithEdges(splitsForCategory({ count: 5, step: 3 }));
 
 		expect(wrapped(fakeSelf(), 0, 1, 2, 0, 0)).toEqual([1, 2]);
+	});
+
+	it('adds no edges on an inverted range, even in always mode', () => {
+		// an inverted range has no meaningful edges to add — isTickable rejects it — so the inner
+		// ticks pass through and neither scaleMin nor scaleMax is injected
+		const wrapped = splitsWithEdges(() => [1, 2, 3], { mode: 'always' });
+
+		expect(wrapped(fakeSelf(), 0, 10, 5, 0, 0)).toEqual([1, 2, 3]);
 	});
 
 	it('does not re-clamp the inner ticks, nor double the edge it already covers', () => {

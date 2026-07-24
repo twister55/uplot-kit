@@ -55,6 +55,15 @@ function isTickable(scaleMin: number, scaleMax: number): boolean {
 	return Number.isFinite(scaleMin) && Number.isFinite(scaleMax) && scaleMin <= scaleMax;
 }
 
+// The rule two generators independently apply to a length-like option: splitsForTime's `ms` (axis
+// units per millisecond) and splitsForStep's `step` (grid spacing) both mean "nothing sensible to
+// scale/space by" unless finite and above zero. Only the predicate is shared — the recovery differs
+// on purpose (ms falls back to its default, step has none and ticks nothing), which is why this is a
+// bare boolean the callers branch on rather than a warn-and-fallback helper.
+function isPositiveFinite(value: number): boolean {
+	return Number.isFinite(value) && value > 0;
+}
+
 // One warn-once tracker per generator instance, so a chart that redraws every frame on a
 // degenerate range logs once, not per frame. Keyed by the message rather than by a single flag:
 // a generator can report structurally unrelated conditions (an unplaceable grid, a capped walk)
@@ -190,6 +199,18 @@ function roundGridValue(value: number, digits: number): number {
 	return digits > 15 ? roundSignificant(value) : roundTo(value, digits);
 }
 
+// Folds `-0` onto `+0`. Every tick-producing path that can reach zero from below — stepGrid's grid
+// phased across the origin, splitsForTime's even-day/week rung starting at Math.ceil(-1/n), an
+// injected `-0` in mergeTicks — routes its emitted value through this, because `-0` is a real axis
+// zero the caller means but `Intl.NumberFormat().format(-0)` renders it as the string "-0", a stray
+// minus on the label. The one shared final path that does NOT need it is normalize(): its `Set`
+// canonicalizes `-0` to `+0` on insertion by spec, so a value laundered there is already clean —
+// but that is a side effect to rely on knowingly, not to rediscover, hence this is the named
+// invariant every other path calls by hand.
+function withoutNegativeZero(value: number): number {
+	return value === 0 ? 0 : value;
+}
+
 // The window, in relative ulps, within which two doubles are treated as the same axis position.
 // A single differently-associated product drifts by one ulp, but a scale bound can reach the
 // comparison having accumulated several through uPlot's own range padding, and a one-ulp window
@@ -315,9 +336,9 @@ function stepGrid(
 			break;
 		}
 		// An anchor that phases the grid across zero produces a raw value a hair below it, which
-		// rounds to `-0` and formats as "-0". Fold it onto the zero the caller means; normalize()
-		// used to launder this through its Set, and the grid now owns its output.
-		if (!into.push(value === 0 ? 0 : value)) {
+		// rounds to `-0` and formats as "-0". Fold it onto the zero the caller means; the grid owns
+		// its output and does not run back through normalize()'s Set.
+		if (!into.push(withoutNegativeZero(value))) {
 			break;
 		}
 	}
@@ -378,6 +399,57 @@ function nearestIsSameTick(sorted: number[], value: number): boolean {
 	return below !== undefined && isSameTick(below, value);
 }
 
+// A copy of `values` guaranteed ascending — but sorted only when it isn't already. Its callers
+// (the injecting decorators) pass a generator's output, which is ascending by construction; a
+// single O(n) order check then skips the O(n log n) sort for that common case, and pays for the
+// sort only for a custom SplitsFn that returned its ticks out of order.
+function ascendingCopy(values: number[]): number[] {
+	for (let i = 1; i < values.length; i++) {
+		const prev = values[i - 1];
+		const cur = values[i];
+		if (prev !== undefined && cur !== undefined && prev > cur) {
+			return [...values].sort((a, b) => a - b);
+		}
+	}
+	return [...values];
+}
+
+// Merge two already-ascending arrays into one ascending array in a single linear pass — used so
+// mergeTicks folds the surviving injected values into the sorted inner ticks without a second sort.
+function mergeSorted(a: number[], b: number[]): number[] {
+	const out: number[] = [];
+	let i = 0;
+	let j = 0;
+	while (i < a.length && j < b.length) {
+		const av = a[i];
+		const bv = b[j];
+		if (av === undefined) {
+			i++;
+		} else if (bv === undefined) {
+			j++;
+		} else if (av <= bv) {
+			out.push(av);
+			i++;
+		} else {
+			out.push(bv);
+			j++;
+		}
+	}
+	for (; i < a.length; i++) {
+		const av = a[i];
+		if (av !== undefined) {
+			out.push(av);
+		}
+	}
+	for (; j < b.length; j++) {
+		const bv = b[j];
+		if (bv !== undefined) {
+			out.push(bv);
+		}
+	}
+	return out;
+}
+
 // How every injecting decorator folds its own values into an inner function's ticks: the
 // injected ones are clamped to [lower, upper], the inner's are taken as given, and the union is
 // deduped and sorted.
@@ -403,19 +475,29 @@ function nearestIsSameTick(sorted: number[], value: number): boolean {
 // sorted rather than arrival order can change which of two isSameTick values wins, but only by a
 // sub-pixel amount neither the grid nor the label can show.
 function mergeTicks(ticks: number[], injected: number[], lower: number, upper: number): number[] {
+	// The same "nothing sensible to tick" guard the generators apply, made explicit here rather
+	// than left to the clamp below being coincidentally unsatisfiable on an inverted range. An
+	// injected value cannot fall inside an empty interval, and range edges have no meaning when the
+	// range is inverted or non-finite, so nothing is added — but the inner ticks are the inner
+	// function's business (a custom one may have ticked anyway), so they pass through sorted rather
+	// than being second-guessed.
+	if (!isTickable(lower, upper)) {
+		return ascendingCopy(ticks);
+	}
+
 	const candidates: number[] = [];
 	for (const value of injected) {
 		if (value >= lower && value <= upper) {
-			// Fold `-0` onto `0` the same way stepGrid does: an injected or edge value of `-0`
-			// (Math.ceil(-1/2), a scaleMin that reached zero from below) formats as "-0" otherwise.
-			candidates.push(value === 0 ? 0 : value);
+			// An injected or edge value of `-0` (Math.ceil(-1/2), a scaleMin that reached zero from
+			// below) formats as "-0" otherwise.
+			candidates.push(withoutNegativeZero(value));
 		}
 	}
 
-	// The inner set is sorted once here regardless — it is the coincidence-check haystack, and the
-	// contract is an ascending result even for a custom inner. With nothing to inject that lone sort
-	// is the whole job; no second pass, no re-sort.
-	const sortedTicks = [...ticks].sort((a, b) => a - b);
+	// The inner set is the coincidence-check haystack and the base of an ascending result, so it is
+	// ordered here — but ascendingCopy sorts it only if it wasn't already ascending (it is, coming
+	// from a generator). With nothing to inject that is the whole job.
+	const sortedTicks = ascendingCopy(ticks);
 	if (candidates.length === 0) {
 		return sortedTicks;
 	}
@@ -435,7 +517,10 @@ function mergeTicks(ticks: number[], injected: number[], lower: number, upper: n
 	if (kept.length === 0) {
 		return sortedTicks;
 	}
-	return sortedTicks.concat(kept).sort((a, b) => a - b);
+	// Both operands are ascending — sortedTicks by construction, kept because candidates were sorted
+	// before the dedup pushed onto it in order — so a linear merge yields the result without a
+	// second sort.
+	return mergeSorted(sortedTicks, kept);
 }
 
 // --- splitsForTime ---
@@ -537,6 +622,15 @@ type SplitLevel = RungStep & {
 // step is phased to a fixed origin (the epoch for days, the year for months and years, the week
 // boundary for weeks) rather than to scaleMin, so the ticks a given zoom level shows do not
 // shift as the user pans — the defining property a "round boundary" axis needs.
+//
+// everyNDays/everyNWeeks are fixed-step arithmetic grids (`anchor + k * step`), the same shape
+// stepGrid computes and splitsForCategory reuses, so it is fair to ask why they aren't routed
+// through stepGrid to inherit its cap and tolerances. They deliberately are not: month/year steps
+// are calendar-irregular (a month is not a fixed number of seconds) and can only be *walked*, so
+// all four rungs share one getInitialValue/getNextValue walk driven by the same loop and bounded by
+// the same MAX_TICK_CANDIDATES cap. Splitting day/week out to stepGrid would fragment that single
+// mechanism into two for no behavioural gain — the cap already gives the walk stepGrid's bound, and
+// these integer-second grids have no fractional drift for stepGrid's ulp tolerance to correct.
 
 // Every `n`-th day, counted from the epoch so a 2- or 4-day rung lands on the same days no matter
 // where the window sits. n = 1 is a plain day boundary.
@@ -787,7 +881,7 @@ export function splitsForTime(options: SplitsForTimeOptions = {}): SplitsFn {
 		warn,
 		'ms',
 		rawMs,
-		Number.isFinite(rawMs) && rawMs > 0,
+		isPositiveFinite(rawMs),
 		'finite and positive',
 		DEFAULT_MS
 	);
@@ -868,9 +962,8 @@ export function splitsForTime(options: SplitsForTimeOptions = {}): SplitsFn {
 		for (const value of boundaries) {
 			if (value >= minSec) {
 				// An even-day/week rung phased across the epoch starts at `-0` (Math.ceil(-1/n)), which
-				// survives the multiply and formats as "-0". Fold it onto zero, as stepGrid does.
-				const scaled = value * unitsPerSec;
-				result.push(scaled === 0 ? 0 : scaled);
+				// survives the multiply and formats as "-0".
+				result.push(withoutNegativeZero(value * unitsPerSec));
 			}
 		}
 		return result;
@@ -1092,7 +1185,7 @@ export function splitsForStep(options: SplitsForStepOptions): SplitsFn {
 	// grid — so an unusable step gives a function that ticks nothing, said once, rather than a
 	// guess. A blank axis with no explanation is the most expensive failure in this file to
 	// track down, and it was the one a plain `step: 0` used to produce.
-	if (!(Number.isFinite(step) && step > 0)) {
+	if (!isPositiveFinite(step)) {
 		warn(`step must be a finite number greater than zero, got ${JSON.stringify(step)} — no ticks`);
 		return () => [];
 	}
