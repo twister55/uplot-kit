@@ -324,23 +324,58 @@ function stepGrid(
 	return into.values;
 }
 
-// Final-output normalization for tick sets that are not already well-formed: dedupe, ascending
-// sort, clamp to the visible range. splitsWithInclude and splitsWithEdges merge two tick sets that
-// can overlap or straddle the range edges, and splitsForLog's decade sweep deliberately overshoots
-// both ends. stepGrid's callers deliberately skip it — see the note there.
+// Clamp a tick set to the visible range, the load-bearing half of normalize(). The bounds are
+// ulp-tolerant, for the same reason stepGrid's own bound test is: a decade boundary and the scale
+// bound meaning to include it can reach the comparison an ulp apart. splitsForLog ceils `lastPower`
+// precisely to recover a `scaleMax` that Math.log rounds a hair under (999.9999999999999 → decade
+// 1000), and a plain `v <= scaleMax` then rejected the very tick the ceil computed. isSameTick lets
+// a bound keep the tick it denotes.
 //
-// The clamp is ulp-tolerant on both bounds, for the same reason stepGrid's own bound test is: a
-// decade boundary and the scale bound meaning to include it can reach the comparison an ulp apart.
-// splitsForLog ceils `lastPower` precisely to recover a `scaleMax` that Math.log rounds a hair under
-// (999.9999999999999 → decade 1000), and a plain `v <= scaleMax` then rejected the very tick the
-// ceil computed. isSameTick lets a bound keep the tick it denotes.
+// Split out from normalize() because a caller whose values are already ascending and unique —
+// splitsForLog on its default minor:false path emits exactly one base**power per ascending power —
+// needs only this clamp, not the Set and sort normalize() adds for sets that can overlap or arrive
+// out of order.
+function clampToRange(values: number[], scaleMin: number, scaleMax: number): number[] {
+	return values.filter(
+		(v) => (v >= scaleMin || isSameTick(v, scaleMin)) && (v <= scaleMax || isSameTick(v, scaleMax))
+	);
+}
+
+// Final-output normalization for tick sets that are not already well-formed: dedupe, ascending
+// sort, clamp to the visible range. splitsForLog's decade sweep with interior mantissas can arrive
+// out of order or with duplicates (a caller-supplied mantissa at or past `base` crosses a decade
+// boundary), so that path needs the full pass. stepGrid's callers deliberately skip it — see the
+// note there.
 function normalize(values: number[], scaleMin: number, scaleMax: number): number[] {
-	return [...new Set(values)]
-		.filter(
-			(v) =>
-				(v >= scaleMin || isSameTick(v, scaleMin)) && (v <= scaleMax || isSameTick(v, scaleMax))
-		)
-		.sort((a, b) => a - b);
+	return clampToRange([...new Set(values)], scaleMin, scaleMax).sort((a, b) => a - b);
+}
+
+// Whether `value` is isSameTick to any element of an ascending `sorted` array. isSameTick is a
+// relative-closeness test, so two values it accepts differ by at most a few ulps and are therefore
+// adjacent in sorted order: the only candidates are the elements straddling `value`, found by
+// binary search. This bounds mergeTicks's coincidence check at O(log n) per injected value instead
+// of a full scan — see the note there.
+function nearestIsSameTick(sorted: number[], value: number): boolean {
+	let lo = 0;
+	let hi = sorted.length;
+	while (lo < hi) {
+		const mid = lo + ((hi - lo) >> 1);
+		const midValue = sorted[mid];
+		// mid is always in [lo, hi) ⊂ [0, length), so midValue is never undefined; the guard is how
+		// the indexed read is narrowed under noUncheckedIndexedAccess without a non-null assertion.
+		if (midValue !== undefined && midValue < value) {
+			lo = mid + 1;
+		} else {
+			hi = mid;
+		}
+	}
+	// lo is the first index at or above `value`; the nearest elements are lo and lo - 1.
+	const above = sorted[lo];
+	if (above !== undefined && isSameTick(above, value)) {
+		return true;
+	}
+	const below = lo > 0 ? sorted[lo - 1] : undefined;
+	return below !== undefined && isSameTick(below, value);
 }
 
 // How every injecting decorator folds its own values into an inner function's ticks: the
@@ -355,23 +390,52 @@ function normalize(values: number[], scaleMin: number, scaleMax: number): number
 // with the raw `0.44999999999999996` under splitsWithEdges — the decorators undoing the
 // generator's own correction. A tick set is the inner function's business; the decorator only
 // answers for what it adds.
+//
+// An injected value is dropped when it is isSameTick to any tick already kept — an inner tick OR an
+// earlier-accepted injected value — because the final Set dedupes by exact equality only, and two
+// values that are isSameTick but not `===` (0.3 and 0.1 + 0.2, or two edges an ulp apart on a
+// near-zero-width range) would otherwise both survive as the sub-pixel double-tick isSameTick
+// exists to prevent. The inner ticks and the injected values are each sorted so both coincidence
+// checks are done against neighbours (binary search into the inner ticks, the previous kept value
+// among the injected) rather than by scanning: splitsWithEdges injects only two edges, but
+// splitsWithInclude's `values` is caller-supplied and uncapped, and a scan there was O(injected ×
+// ticks) — a few hundred thresholds over a densely stepped inner axis. Processing the injected in
+// sorted rather than arrival order can change which of two isSameTick values wins, but only by a
+// sub-pixel amount neither the grid nor the label can show.
 function mergeTicks(ticks: number[], injected: number[], lower: number, upper: number): number[] {
-	// Each injected value is tested against everything already kept — the inner ticks AND the
-	// injected values accepted before it — not just against `ticks`. Testing only against `ticks`
-	// let two injected values that are isSameTick to each other but not `===` (e.g. 0.3 and
-	// 0.1 + 0.2, or two edges an ulp apart on a near-zero-width range) both survive the final Set,
-	// which dedupes by exact equality only — the very sub-pixel double-tick isSameTick exists to
-	// prevent. The injected lists here are tiny (thresholds, the two range edges), so the
-	// quadratic scan is free.
-	const merged = [...ticks];
+	const candidates: number[] = [];
 	for (const value of injected) {
-		if (value >= lower && value <= upper && !merged.some((tick) => isSameTick(tick, value))) {
+		if (value >= lower && value <= upper) {
 			// Fold `-0` onto `0` the same way stepGrid does: an injected or edge value of `-0`
 			// (Math.ceil(-1/2), a scaleMin that reached zero from below) formats as "-0" otherwise.
-			merged.push(value === 0 ? 0 : value);
+			candidates.push(value === 0 ? 0 : value);
 		}
 	}
-	return merged.sort((a, b) => a - b);
+
+	// The inner set is sorted once here regardless — it is the coincidence-check haystack, and the
+	// contract is an ascending result even for a custom inner. With nothing to inject that lone sort
+	// is the whole job; no second pass, no re-sort.
+	const sortedTicks = [...ticks].sort((a, b) => a - b);
+	if (candidates.length === 0) {
+		return sortedTicks;
+	}
+
+	candidates.sort((a, b) => a - b);
+	const kept: number[] = [];
+	// isSameTick(NaN, value) is false, so the first candidate always clears the against-injected
+	// guard; sorted order makes the previous kept value the nearest kept one below the current.
+	let lastKept = NaN;
+	for (const value of candidates) {
+		if (isSameTick(lastKept, value) || nearestIsSameTick(sortedTicks, value)) {
+			continue;
+		}
+		kept.push(value);
+		lastKept = value;
+	}
+	if (kept.length === 0) {
+		return sortedTicks;
+	}
+	return sortedTicks.concat(kept).sort((a, b) => a - b);
 }
 
 // --- splitsForTime ---
@@ -900,7 +964,11 @@ export function splitsForLog(options: SplitsForLogOptions = {}): SplitsFn {
 	// decade-only axis. An explicit [] is honoured; only an omitted option takes the base default.
 	// Copied, because the array is read on every redraw but supplied once: without this, a caller
 	// who keeps their own reference and mutates it later silently rewrites an already-built axis.
-	const mantissas = [...(minorMantissas ?? (base === 10 ? [2, 3, 4, 5, 6, 7, 8, 9] : []))];
+	// Built only when minor ticks are actually emitted — the default minor:false path never reads
+	// it, so allocating and pinning the default 1-2-…-9 array there is pure waste.
+	const mantissas = minor
+		? [...(minorMantissas ?? (base === 10 ? [2, 3, 4, 5, 6, 7, 8, 9] : []))]
+		: [];
 	// base is fixed at factory time, so its log is too — hoisted out of the per-redraw closure
 	// below, where it was recomputed on every draw.
 	const logBase = Math.log(base);
@@ -950,7 +1018,13 @@ export function splitsForLog(options: SplitsForLogOptions = {}): SplitsFn {
 			}
 		}
 
-		return normalize(collector.values, scaleMin, scaleMax);
+		// minor:false emits one base**power per ascending power — already sorted and unique, so it
+		// needs only the clamp, not normalize()'s Set and sort. minor:true can arrive out of order
+		// or with duplicates when a caller-supplied mantissa reaches or crosses `base`, so it takes
+		// the full pass.
+		return minor
+			? normalize(collector.values, scaleMin, scaleMax)
+			: clampToRange(collector.values, scaleMin, scaleMax);
 	};
 }
 
@@ -1239,22 +1313,27 @@ export function splitsWithInclude(inner: SplitsFn, values: number[]): SplitsFn {
  * ```
  */
 export function splitsWithLimit(inner: SplitsFn, maxTicks: number): SplitsFn {
+	// maxTicks is closed over, so how it classifies never changes across redraws — resolved once
+	// here rather than re-tested on every frame, the same principle the generators follow for their
+	// own options.
+	//
+	// "Not measured yet" is not "show nothing", so an unusable limit passes the ticks through
+	// unthinned rather than blanking the axis. It arrives spelled three ways: `NaN` from a division
+	// that had a zero label width, and — since the caller doing the measuring is often plain JS —
+	// `undefined` or `null` from a width that was never assigned. `Infinity` is an explicit no-limit
+	// and lands in the same place. `-Infinity` is deliberately not in this company: it orders below
+	// every real limit, so it falls through to the "nothing fits" case.
+	const unbounded = typeof maxTicks !== 'number' || Number.isNaN(maxTicks) || maxTicks === Infinity;
+	// Floored, because a measurement-derived limit is the fractional `plotWidth / labelWidth` and
+	// half a label does not fit. Thinning against the raw fraction would bound the result by
+	// ceil(maxTicks) instead of maxTicks — 11 ticks under `maxTicks: 2.5` would return 3.
+	const limit = Math.floor(maxTicks);
+
 	return (self, axisIdx, scaleMin, scaleMax, foundIncr, foundSpace) => {
 		const ticks = inner(self, axisIdx, scaleMin, scaleMax, foundIncr, foundSpace);
-		// "Not measured yet" is not "show nothing", so an unusable limit passes the ticks
-		// through unthinned rather than blanking the axis. It arrives spelled three ways: `NaN`
-		// from a division that had a zero label width, and — since the caller doing the
-		// measuring is often plain JS — `undefined` or `null` from a width that was never
-		// assigned. `Infinity` is an explicit no-limit and lands in the same place. `-Infinity`
-		// is deliberately not in this company: it orders below every real limit, so it falls
-		// through to the "nothing fits" case below.
-		if (typeof maxTicks !== 'number' || Number.isNaN(maxTicks) || maxTicks === Infinity) {
+		if (unbounded) {
 			return ticks;
 		}
-		// Floored, because a measurement-derived limit is the fractional `plotWidth / labelWidth`
-		// and half a label does not fit. Thinning against the raw fraction would bound the result
-		// by ceil(maxTicks) instead of maxTicks — 11 ticks under `maxTicks: 2.5` would return 3.
-		const limit = Math.floor(maxTicks);
 		if (limit <= 0) {
 			return [];
 		}

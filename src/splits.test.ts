@@ -1225,6 +1225,21 @@ describe('splitsWithInclude', () => {
 		expect(result).toEqual([0, 0.3, 10, 20, 30]);
 	});
 
+	it('sorts and dedupes a large injected set against an unsorted inner tick set', () => {
+		// exercises the bounded merge path (binary search into the inner ticks, sorted-order dedup
+		// among the injected): the inner deliberately returns ticks out of order, and the injected
+		// values include a one-ulp-noisy duplicate of an inner tick (20 and 20 + 4e-15) and of
+		// another injected value (25 and 25 + 4e-15) — neither may produce a doubled sub-pixel tick.
+		const inner: SplitsFn = () => [30, 10, 20, 50, 40];
+		const injected = [20 + 4e-15, 25, 25 + 4e-15, ...Array.from({ length: 37 }, (_, i) => 100 + i)];
+
+		const result = splitsWithInclude(inner, injected)(fakeSelf(), 0, 0, 60, 0, 0);
+
+		// ascending, and the inner tick 20 absorbed its noisy injected twin; 25 kept once; the
+		// 100+ values are all out of the [0, 60] range and dropped
+		expect(result).toEqual([10, 20, 25, 30, 40, 50]);
+	});
+
 	it('does not let a caller mutate the injected values after the fact', () => {
 		const thresholds = [25];
 		const wrapped = splitsWithInclude(splitsForStep({ step: 10 }), thresholds);
