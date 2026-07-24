@@ -603,6 +603,14 @@ describe('splitsForTime', () => {
 			expect((value + offsetSec * 1000) % 86_400_000).toBe(0);
 		}
 	});
+
+	it('never emits negative zero on an even-day rung phased across the epoch', () => {
+		// the every-2-day rung starts at Math.ceil(-1/2) === -0 for the day before 1970-01-01
+		const result = splitsForTime({ granularity: 'day' })(fakeSelf(), 0, -1, 10 * 86400, 0, 0);
+
+		expect(result[0]).toBe(0);
+		expect(result.some((value) => Object.is(value, -0))).toBe(false);
+	});
 });
 
 describe('splitsForLog', () => {
@@ -798,6 +806,14 @@ describe('splitsForLog', () => {
 			warn.mockRestore();
 		}
 	});
+
+	it('keeps the decade at scaleMax when it sits a ulp below a power of base', () => {
+		// lastPower ceils to 3 and computes 1000; the clamp must not reject it for being an ulp
+		// above a scaleMax that Math.log rounded a hair under
+		const result = splitsForLog()(fakeSelf(), 0, 1, 999.9999999999999, 0, 0);
+
+		expect(result).toEqual([1, 10, 100, 1000]);
+	});
 });
 
 describe('splitsForStep', () => {
@@ -967,13 +983,19 @@ describe('splitsForStep', () => {
 		expect(result.some((value) => Object.is(value, -0))).toBe(false);
 	});
 
-	it('refuses a non-finite anchor rather than emitting NaN ticks', () => {
+	it('falls back to a zero anchor on a non-finite anchor, blaming anchor not step', () => {
 		const warn = vi.spyOn(console, 'warn').mockImplementation(() => {});
 		try {
 			const splits = splitsForStep({ step: 10, anchor: Infinity });
 
-			expect(splits(fakeSelf(), 0, 0, 100, 0, 0)).toEqual([]);
+			// anchor has a default, so a bad one falls back to 0 and the (valid) step-10 grid
+			// still ticks — rather than blanking the axis under a "step is too small" warning
+			// that names the wrong option.
+			expect(splits(fakeSelf(), 0, 0, 100, 0, 0)).toEqual([
+				0, 10, 20, 30, 40, 50, 60, 70, 80, 90, 100
+			]);
 			expect(warn).toHaveBeenCalledOnce();
+			expect(warn.mock.calls[0]?.[0]).toContain('anchor');
 		} finally {
 			warn.mockRestore();
 		}
@@ -1111,6 +1133,13 @@ describe('splitsWithInclude', () => {
 		const result = wrapped(fakeSelf(), 0, 0, 30, 0, 0);
 
 		expect(result).toEqual([0, 10, 20, 30]);
+	});
+
+	it('never emits negative zero for an injected -0', () => {
+		const result = splitsWithInclude(() => [5], [-0])(fakeSelf(), 0, -50, 50, 0, 0);
+
+		expect(result[0]).toBe(0);
+		expect(result.some((value) => Object.is(value, -0))).toBe(false);
 	});
 
 	it('clamps injected values to the visible range', () => {

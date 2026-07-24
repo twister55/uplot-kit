@@ -328,8 +328,19 @@ function stepGrid(
 // sort, clamp to the visible range. splitsWithInclude and splitsWithEdges merge two tick sets that
 // can overlap or straddle the range edges, and splitsForLog's decade sweep deliberately overshoots
 // both ends. stepGrid's callers deliberately skip it — see the note there.
+//
+// The clamp is ulp-tolerant on both bounds, for the same reason stepGrid's own bound test is: a
+// decade boundary and the scale bound meaning to include it can reach the comparison an ulp apart.
+// splitsForLog ceils `lastPower` precisely to recover a `scaleMax` that Math.log rounds a hair under
+// (999.9999999999999 → decade 1000), and a plain `v <= scaleMax` then rejected the very tick the
+// ceil computed. isSameTick lets a bound keep the tick it denotes.
 function normalize(values: number[], scaleMin: number, scaleMax: number): number[] {
-	return [...new Set(values)].filter((v) => v >= scaleMin && v <= scaleMax).sort((a, b) => a - b);
+	return [...new Set(values)]
+		.filter(
+			(v) =>
+				(v >= scaleMin || isSameTick(v, scaleMin)) && (v <= scaleMax || isSameTick(v, scaleMax))
+		)
+		.sort((a, b) => a - b);
 }
 
 // How every injecting decorator folds its own values into an inner function's ticks: the
@@ -355,7 +366,9 @@ function mergeTicks(ticks: number[], injected: number[], lower: number, upper: n
 	const merged = [...ticks];
 	for (const value of injected) {
 		if (value >= lower && value <= upper && !merged.some((tick) => isSameTick(tick, value))) {
-			merged.push(value);
+			// Fold `-0` onto `0` the same way stepGrid does: an injected or edge value of `-0`
+			// (Math.ceil(-1/2), a scaleMin that reached zero from below) formats as "-0" otherwise.
+			merged.push(value === 0 ? 0 : value);
 		}
 	}
 	return merged.sort((a, b) => a - b);
@@ -765,7 +778,10 @@ export function splitsForTime(options: SplitsForTimeOptions = {}): SplitsFn {
 		const result: number[] = [];
 		for (const value of boundaries) {
 			if (value >= minSec) {
-				result.push(value * unitsPerSec);
+				// An even-day/week rung phased across the epoch starts at `-0` (Math.ceil(-1/n)), which
+				// survives the multiply and formats as "-0". Fold it onto zero, as stepGrid does.
+				const scaled = value * unitsPerSec;
+				result.push(scaled === 0 ? 0 : scaled);
 			}
 		}
 		return result;
@@ -970,7 +986,7 @@ export interface SplitsForStepOptions {
  * ```
  */
 export function splitsForStep(options: SplitsForStepOptions): SplitsFn {
-	const { step, anchor = 0 } = options;
+	const { step, anchor: rawAnchor = 0 } = options;
 	const warn = makeWarnOnce('splitsForStep');
 
 	// The one option here with no default to fall back to — a grid without a spacing is not a
@@ -981,6 +997,19 @@ export function splitsForStep(options: SplitsForStepOptions): SplitsFn {
 		warn(`step must be a finite number greater than zero, got ${JSON.stringify(step)} — no ticks`);
 		return () => [];
 	}
+
+	// anchor does have a default (0), so unlike step it falls back rather than blanking the axis.
+	// It is validated here so a non-finite anchor is named for what it is: left unchecked it flowed
+	// into stepGrid's magnitude guard (magnitude becomes Infinity) and tripped the "step is too
+	// small" warning, blaming a perfectly valid step for anchor's fault.
+	const anchor = optionOr(
+		warn,
+		'anchor',
+		rawAnchor,
+		Number.isFinite(rawAnchor),
+		'a finite number',
+		0
+	);
 
 	// A tick is only ever as precise as the two numbers that define the grid, so rounding to
 	// whichever of them carries more decimals removes float noise without moving a tick the
