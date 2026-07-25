@@ -1598,4 +1598,22 @@ describe('splitsWithEdges', () => {
 
 		expect(wrapped(fakeSelf(), 0, 5, 25, 0, 0)).toEqual([5, 10, 20, 25]);
 	});
+
+	it('warns once and falls back to whenEmpty for an unrecognized mode', () => {
+		const warn = vi.spyOn(console, 'warn').mockImplementation(() => {});
+		try {
+			// a typo that TypeScript would reject, arriving from plain JS or a cast config
+			const wrapped = splitsWithEdges(splitsForStep({ step: 10 }), {
+				mode: 'Always' as 'always'
+			});
+
+			// whenEmpty behavior: base ticks are non-empty, so no edges are appended
+			expect(wrapped(fakeSelf(), 0, 5, 25, 0, 0)).toEqual([10, 20]);
+			// invalid on a second redraw too, but reported only once (checked at factory time)
+			expect(wrapped(fakeSelf(), 0, 5, 25, 0, 0)).toEqual([10, 20]);
+			expect(warn).toHaveBeenCalledOnce();
+		} finally {
+			warn.mockRestore();
+		}
+	});
 });

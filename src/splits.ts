@@ -464,12 +464,15 @@ function mergeSorted(a: number[], b: number[]): number[] {
 // answers for what it adds.
 //
 // An injected value is dropped when it is isSameTick to any tick already kept — an inner tick OR an
-// earlier-accepted injected value — because the final Set dedupes by exact equality only, and two
-// values that are isSameTick but not `===` (0.3 and 0.1 + 0.2, or two edges an ulp apart on a
-// near-zero-width range) would otherwise both survive as the sub-pixel double-tick isSameTick
-// exists to prevent. The inner ticks and the injected values are each sorted so both coincidence
-// checks are done against neighbours (binary search into the inner ticks, the previous kept value
-// among the injected) rather than by scanning: splitsWithEdges injects only two edges, but
+// earlier-accepted injected value. isSameTick, not `===`: two values an ulp apart (0.3 and
+// 0.1 + 0.2, or two edges on a near-zero-width range) are not `===` yet would land on the same
+// pixel, and folding them in by exact equality alone would leave the sub-pixel double-tick
+// isSameTick exists to prevent. Only the *injected* side is deduped this way; the inner ticks pass
+// through as the inner function emitted them (they are not tested against each other), for the
+// reason stated at the top of this comment — a tick set is the inner function's business. The inner
+// ticks and the injected values are each sorted so both coincidence checks are done against
+// neighbours (binary search into the inner ticks, the previous kept value among the injected)
+// rather than by scanning: splitsWithEdges injects only two edges, but
 // splitsWithInclude's `values` is caller-supplied and uncapped, and a scan there was O(injected ×
 // ticks) — a few hundred thresholds over a densely stepped inner axis. Processing the injected in
 // sorted rather than arrival order can change which of two isSameTick values wins, but only by a
@@ -1323,11 +1326,23 @@ export function splitsForCategory(options: SplitsForCategoryOptions = {}): Split
 
 /**
  * Wraps a `SplitsFn` so its output always includes the given values — e.g. a zero baseline
- * or an alert threshold — in addition to whatever the inner function ticks. The result is
- * deduplicated and sorted, and the injected values are clamped to the visible range: one outside
- * it is dropped rather than extending the axis, so pin the scale (`scales.y.range`) if a
- * threshold must stay visible while the user zooms. The inner function's own ticks are passed
- * through as it emitted them.
+ * or an alert threshold — in addition to whatever the inner function ticks. The result is sorted,
+ * and the injected values are clamped to the visible range: one outside it is dropped rather than
+ * extending the axis, so pin the scale (`scales.y.range`) if a threshold must stay visible while
+ * the user zooms.
+ *
+ * Deduplication is applied to the *injected* side only: an injected value that lands on the same
+ * pixel as an inner tick, or as another injected value, is dropped so no gridline is doubled. The
+ * inner function's own ticks are passed through exactly as it emitted them — they are not deduped
+ * against each other, since a tick set is the inner function's business, decided with more context
+ * than this decorator has. A custom inner `SplitsFn` that returns duplicate or sub-pixel-adjacent
+ * ticks keeps them; the generators in this module never do.
+ *
+ * The clamp to `[scaleMin, scaleMax]` is an exact `>= / <=` comparison, not the ulp-tolerant
+ * `isSameTick` the generators use for their own boundary ticks. An injected value a rounding step
+ * outside the visible range is therefore dropped even if the inner function happens to emit a tick
+ * at that same position — inject the in-range value you want kept rather than one that only rounds
+ * into range.
  *
  * The clamp is to the visible range `[scaleMin, scaleMax]` only, not to any narrower domain the
  * inner generator enforces for its *own* ticks. On a `splitsForCategory({ count })` axis whose
@@ -1569,7 +1584,20 @@ export interface SplitsWithEdgesOptions {
  * ```
  */
 export function splitsWithEdges(inner: SplitsFn, options: SplitsWithEdgesOptions = {}): SplitsFn {
-	const { mode = 'whenEmpty' } = options;
+	// The same validate-and-warn-once policy the generators apply to their options: `mode` is a
+	// two-value enum, so a typo (`'Always'`) or a value cast into shape from plain JS would
+	// otherwise fall silently to the `whenEmpty` branch and never add the edges the caller asked
+	// for. Named, reported once, replaced by the default — checked at factory time because the
+	// option is closed over and cannot change per redraw.
+	const warn = makeWarnOnce('splitsWithEdges');
+	const mode = optionOr(
+		warn,
+		'mode',
+		options.mode ?? 'whenEmpty',
+		options.mode === undefined || options.mode === 'always' || options.mode === 'whenEmpty',
+		"'always' or 'whenEmpty'",
+		'whenEmpty' as const
+	);
 	return (self, axisIdx, scaleMin, scaleMax, foundIncr, foundSpace) => {
 		const ticks = inner(self, axisIdx, scaleMin, scaleMax, foundIncr, foundSpace);
 		// Both modes go through the same merge, so the two differ only in *when* the edges are
