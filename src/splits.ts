@@ -677,7 +677,12 @@ function everyNMonths(n: number): RungStep {
 			scratchDate.setTime((scaleMin + ctx.offsetSec) * 1000);
 			const monthIndex = scratchDate.getUTCFullYear() * 12 + scratchDate.getUTCMonth();
 			const aligned = Math.ceil(monthIndex / n) * n;
-			return utcMonthStart(Math.floor(aligned / 12), aligned % 12) / 1000 - ctx.offsetSec;
+			const year = Math.floor(aligned / 12);
+			// Month-of-year is `aligned - year * 12`, not `aligned % 12`: JS `%` keeps the sign of
+			// the dividend, so a BCE (negative) month-index would hand utcMonthStart a negative
+			// month, which it rolls back into the previous year — double-counting the year and
+			// starting the walk ~12 months too early. Floor-division's remainder is always 0..11.
+			return utcMonthStart(year, aligned - year * 12) / 1000 - ctx.offsetSec;
 		},
 		getNextValue: (currentValue, ctx) => startOfMonth(currentValue, ctx.offsetSec, n)
 	};

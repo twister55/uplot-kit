@@ -250,6 +250,25 @@ describe('splitsForTime', () => {
 		]);
 	});
 
+	it('ticks month starts on a BCE (negative-timestamp) axis', () => {
+		// everyNMonths.getInitialValue decomposes a whole month-index back into (year, month). A
+		// BCE timestamp makes that index negative, where `aligned % 12` would go negative and
+		// double-count the year — the self-correcting walk hides it in the emitted output, so this
+		// pins the correct months as a guard for any future rung whose phase the walk would not fix.
+		const splits = splitsForTime({ granularity: 'month' });
+		const scaleMin = unixSec('-000100-02-15T00:00:00Z');
+		const scaleMax = unixSec('-000100-06-05T00:00:00Z');
+
+		const result = splits(fakeSelf(), 0, scaleMin, scaleMax, 0, 0);
+
+		expect(result).toEqual([
+			unixSec('-000100-03-01T00:00:00Z'),
+			unixSec('-000100-04-01T00:00:00Z'),
+			unixSec('-000100-05-01T00:00:00Z'),
+			unixSec('-000100-06-01T00:00:00Z')
+		]);
+	});
+
 	it('widens gradually across a crossover instead of collapsing to one tick', () => {
 		const splits = splitsForTime({ granularity: 'day' });
 		const start = unixSec('2026-01-05T00:00:00Z');
