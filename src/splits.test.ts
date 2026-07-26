@@ -886,6 +886,21 @@ describe('splitsForLog', () => {
 		}
 	});
 
+	it('emits no infinite tick when scaleMax overflows the next decade', () => {
+		// lastPower ceils to 309 and 10 ** 309 is Infinity; the clamp cannot catch it on its own,
+		// since isSameTick(Infinity, scaleMax) degenerates to Infinity <= Infinity
+		const major = splitsForLog()(fakeSelf(), 0, 1, Number.MAX_VALUE, 0, 0);
+
+		expect(major.every(Number.isFinite)).toBe(true);
+		expect(major.at(-1)).toBe(1e308);
+
+		// the top decade is finite, but its mantissas are not: 9 * 1e308 overflows too
+		const minor = splitsForLog({ minor: true })(fakeSelf(), 0, 1, Number.MAX_VALUE, 0, 0);
+
+		expect(minor.every(Number.isFinite)).toBe(true);
+		expect(minor.at(-1)).toBe(1e308);
+	});
+
 	it('keeps the decade at scaleMax when it sits a ulp below a power of base', () => {
 		// lastPower ceils to 3 and computes 1000; the clamp must not reject it for being an ulp
 		// above a scaleMax that Math.log rounded a hair under

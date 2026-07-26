@@ -356,9 +356,18 @@ function stepGrid(
 // splitsForLog on its default minor:false path emits exactly one base**power per ascending power —
 // needs only this clamp, not the Set and sort normalize() adds for sets that can overlap or arrive
 // out of order.
+//
+// The finiteness test is not redundant with the bound tests, because the tolerance that makes those
+// bounds forgiving degenerates on an infinite operand: isSameTick(Infinity, scaleMax) compares
+// Infinity <= Infinity and answers true, so an overflowed candidate would clear *any* finite bound.
+// The bounds themselves are always finite here (isTickable admits nothing else), so a non-finite
+// candidate is out of range by definition.
 function clampToRange(values: number[], scaleMin: number, scaleMax: number): number[] {
 	return values.filter(
-		(v) => (v >= scaleMin || isSameTick(v, scaleMin)) && (v <= scaleMax || isSameTick(v, scaleMax))
+		(v) =>
+			Number.isFinite(v) &&
+			(v >= scaleMin || isSameTick(v, scaleMin)) &&
+			(v <= scaleMax || isSameTick(v, scaleMax))
 	);
 }
 
@@ -1100,6 +1109,14 @@ export function splitsForLog(options: SplitsForLogOptions = {}): SplitsFn {
 		const collector = makeCollector(warn);
 		for (let power = firstPower; power <= lastPower; power++) {
 			const decade = base ** power;
+			// lastPower is a ceil of a log, so it can name a decade that overflows: a scaleMax just
+			// under Number.MAX_VALUE ceils to 309, and 10 ** 309 is Infinity. Stop there rather than
+			// sweep decades that cannot be ticked, the same way stepGrid stops on a non-finite grid
+			// point. clampToRange drops the overflowed values either way; this only keeps them from
+			// spending candidate slots first.
+			if (!Number.isFinite(decade)) {
+				break;
+			}
 			const values = [decade];
 			if (minor) {
 				// Scaling a mantissa into a decade is inexact at both ends of the range — 9 * 0.001
