@@ -51,6 +51,61 @@ describe('incrsLadder', () => {
 		expect(incrsLadder(10, 0, 5, [])).toStrictEqual([]);
 	});
 
+	it('stays exact for any base that is a product of 2s and 5s, not just 2/5/10', () => {
+		// The decimal budget used to be |exp| places regardless of base, which is only enough when
+		// one negative power of the base fits in that many decimals. Anything denser truncated:
+		// base 4 gave 0.016 for 4^-3, and base 16 and up collapsed to exactly 0.
+		expect(incrsLadder(4, -3, -1, [1])).toStrictEqual([4 ** -3, 4 ** -2, 4 ** -1]);
+		expect(incrsLadder(8, -3, -1, [1])).toStrictEqual([8 ** -3, 8 ** -2, 8 ** -1]);
+		expect(incrsLadder(16, -3, -1, [1])).toStrictEqual([16 ** -3, 16 ** -2, 16 ** -1]);
+		expect(incrsLadder(20, -2, -1, [1])).toStrictEqual([20 ** -2, 20 ** -1]);
+	});
+
+	it('gives the "one byte expressed in KiB" rung its real value, not 0', () => {
+		expect(incrsLadder(1024, -1, -1, [1])).toStrictEqual([1024 ** -1]);
+	});
+
+	it('falls back to the nearest float for a base with no finite decimal form', () => {
+		// 3 and 60 (the sexagesimal base a duration ladder would reach for) have a prime factor
+		// outside {2, 5}, so 3^-1 is 0.333... with no exact decimal to round onto. The closest
+		// representable value is the best available answer — rounding to |exp| places gave 0.3.
+		expect(incrsLadder(3, -2, -1, [1])).toStrictEqual([3 ** -2, 3 ** -1]);
+		expect(incrsLadder(60, -2, -1, [1])).toStrictEqual([60 ** -2, 60 ** -1]);
+	});
+
+	it("keeps the base-2 ladder bit-identical to uPlot's own internal generator", () => {
+		// uPlot pre-registers genIncrs(2, -53, 53, [1]) in the fixedDec map it looks a tick's
+		// decimal count up in, and its rounding drifts a few ulps below 2^-21. Matching that map
+		// matters more than being closer to the mathematical value, so the drift is preserved --
+		// these are the drifted values, asserted deliberately.
+		expect(incrsLadder(2, -22, -22, [1])).toStrictEqual([2.384185791015627e-7]);
+		expect(incrsLadder(2, -30, -30, [1])).toStrictEqual([9.313225746154791e-10]);
+	});
+
+	it('handles a mantissa that only has an exponential string form', () => {
+		// String(1e-7) is '1e-7', and the base-10 fast path builds its literal by concatenation --
+		// '1e-7' + 'e-3' is unparseable, and every such mantissa used to come back NaN.
+		expect(incrsLadder(10, -3, -3, [1, 1e-7, 1e21])).toStrictEqual([0.001, 1e-10, 1e18]);
+	});
+
+	it('drops exponents that saturate float64 instead of shipping Infinity or 0', () => {
+		// Neither is usable as an axis increment: findIncr divides by it.
+		expect(incrsLadder(10, 400, 400, [1])).toStrictEqual([]);
+		expect(incrsLadder(10, -400, -400, [1])).toStrictEqual([]);
+	});
+
+	it('rejects arguments that would hang or poison the ladder', () => {
+		// maxExp: Infinity is the sharp one -- the loop bound is inclusive (a deliberate
+		// divergence from uPlot), so it never terminates rather than returning empty.
+		expect(() => incrsLadder(10, 0, Infinity, [1])).toThrow(RangeError);
+		expect(() => incrsLadder(10, -0.5, 0.5, [1])).toThrow(RangeError);
+		expect(() => incrsLadder(10, NaN, 1, [1])).toThrow(RangeError);
+		expect(() => incrsLadder(0, 0, 1, [1])).toThrow(RangeError);
+		expect(() => incrsLadder(Infinity, 0, 1, [1])).toThrow(RangeError);
+		expect(() => incrsLadder(10, 0, 1, [1, NaN])).toThrow(RangeError);
+		expect(() => incrsLadder(10, 0, 1, [Infinity])).toThrow(RangeError);
+	});
+
 	it('orders results by exponent then by mantissa order, ascending for positive mantissas', () => {
 		const incrs = incrsLadder(10, 0, 2, [1, 2, 5]);
 		incrs.reduce((previous, current) => {
@@ -202,6 +257,20 @@ describe('incrsFor* facades', () => {
 		it('returns an empty array (not a throw) when the bounds admit nothing', () => {
 			expect(incrsForSeconds({ minIncr: 1, maxIncr: 0 })).toStrictEqual([]);
 		});
+
+		it('ignores a NaN bound instead of emptying the ladder', () => {
+			// `incr >= NaN` is false for every rung, so an unparsed Number(userInput) used to drop
+			// every increment -- and an empty axis.incrs makes uPlot render no ticks at all, which
+			// looks identical to the deliberate empty case above.
+			const all = incrsForSeconds().length;
+			expect(incrsForSeconds({ minIncr: NaN })).toHaveLength(all);
+			expect(incrsForSeconds({ maxIncr: NaN })).toHaveLength(all);
+			expect(incrsForSeconds({ minIncr: Number('1h') })).toHaveLength(all);
+		});
+
+		it('still honours a deliberate 0 bound', () => {
+			expect(incrsForSeconds({ minIncr: 0 })).toHaveLength(incrsForSeconds().length);
+		});
 	});
 });
 
@@ -221,10 +290,33 @@ describe('incrsByUnit', () => {
 		const custom = [1, 2, 4, 8, 16];
 		expect(incrsByUnit(custom, { minIncr: 4, maxIncr: 8 })).toStrictEqual([4, 8]);
 	});
+
+	// This is the module's runtime-dispatch entry point, so its argument is exactly the one that
+	// can arrive unvalidated from a chart config -- and TypeScript can't help there.
+	it.each(['gigabyte', 'valueOf', 'toString', 'constructor', '__proto__'])(
+		'throws a named TypeError for the unrecognised kind %s',
+		(kind) => {
+			expect(() => incrsByUnit(kind as IncrsByUnitKind)).toThrow(TypeError);
+			expect(() => incrsByUnit(kind as IncrsByUnitKind)).toThrow(/unknown unit/);
+		}
+	);
+
+	it('never leaks the shared facade map through an inherited key', () => {
+		// A bare lookup resolved Object.prototype.valueOf and invoked it, returning the private
+		// facade singleton typed as number[] -- one delete on it would have broken every chart in
+		// the process.
+		let leaked: unknown;
+		try {
+			leaked = incrsByUnit('valueOf' as IncrsByUnitKind);
+		} catch {
+			leaked = undefined;
+		}
+		expect(leaked).toBeUndefined();
+	});
 });
 
 describe('incrsStep', () => {
-	it('scales the default whole-number ladder by base', () => {
+	it('scales the default whole-number ladder by step', () => {
 		const values = incrsStep(900);
 		expect(values).toContain(900); // 900 * 1
 		expect(values).toContain(1800); // 900 * 2
@@ -233,8 +325,25 @@ describe('incrsStep', () => {
 		expect(values).toContain(22500); // 900 * 25
 	});
 
-	it('does not offer a value that is not a multiple of base', () => {
+	it('does not offer a value that is not a multiple of step', () => {
 		expect(incrsStep(900)).not.toContain(1350); // 900 * 1.5
+	});
+
+	it('emits exact multiples for a fractional step, not raw float products', () => {
+		// 25 * 1.1 is 27.500000000000004 in float64. uPlot steps its splits by the increment and
+		// derives the label's decimal count from it, so the dirt surfaces verbatim through any
+		// custom axis.values formatter (`${v}s`) -- the byte/duration case this module exists for.
+		expect(incrsStep(1.1).slice(0, 8)).toStrictEqual([1.1, 2.2, 5.5, 11, 22, 27.5, 55, 110]);
+		expect(incrsStep(2.3).slice(0, 8)).toStrictEqual([2.3, 4.6, 11.5, 23, 46, 57.5, 115, 230]);
+	});
+
+	it('keeps the product exact when the mults carry decimals too', () => {
+		// The decimal budget is step's places plus the mult's own, not just step's.
+		expect(incrsStep(1.1, { mults: [1, 2.5, 25] })).toStrictEqual([1.1, 2.75, 27.5]);
+	});
+
+	it('handles a step small enough that String() writes it in exponential form', () => {
+		expect(incrsStep(1e-7).slice(0, 5)).toStrictEqual([1e-7, 2e-7, 5e-7, 1e-6, 2e-6]);
 	});
 
 	it('returns a sorted, duplicate-free ladder', () => {
@@ -246,7 +355,7 @@ describe('incrsStep', () => {
 		});
 	});
 
-	it('uses custom mults verbatim, in the given order, scaled by base', () => {
+	it('uses custom mults verbatim, in the given order, scaled by step', () => {
 		expect(incrsStep(900, { mults: [1, 4, 16, 96] })).toStrictEqual([900, 3600, 14400, 86400]);
 	});
 

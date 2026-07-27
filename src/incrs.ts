@@ -12,11 +12,14 @@
 // collect values like 2.5000000000000004e-7, and uPlot derives a tick label's decimal-place
 // count from the increment itself — a dirty increment produces a dirty label.
 
-// Decimal-place count from a mantissa's string form. Mantissas are expected in plain notation
-// (2.5, not 2.5e-1) — every caller in this package satisfies that, so exponential notation
-// (which would undercount) never reaches this function.
+// Decimal-place count from a number's string form. Unlike uPlot's own guessDec this also folds in
+// an exponent, because String() switches to exponential notation below 1e-6 and at/above 1e21
+// (1e-7 -> 7, 2.5e-7 -> 8) — values a caller can hand to incrsLadder's mantissas or incrsStep's
+// step, where undercounting to 0 would round the increment away to nothing.
 function guessDec(num: number): number {
-	return (String(num).split('.')[1] ?? '').length;
+	const [mantissa = '', exp] = String(num).split('e');
+	const fractionLen = (mantissa.split('.')[1] ?? '').length;
+	return Math.max(0, fractionLen - (exp === undefined ? 0 : Number(exp)));
 }
 
 // Half-away-from-zero rounding; the (1 + EPSILON) factor nudges a binary approximation that's
@@ -26,7 +29,37 @@ function roundDec(val: number, dec: number): number {
 		return val;
 	}
 	const p = 10 ** dec;
+	// Past dec 308 the scale factor itself overflows, and val * Infinity / Infinity is NaN — a
+	// magnitude too small to round is returned as-is rather than destroyed.
+	if (!Number.isFinite(p)) {
+		return val;
+	}
 	return Math.round(val * p * (1 + Number.EPSILON)) / p;
+}
+
+// Decimal places one negative power of `base` needs to stay exact, or null when `base` has a prime
+// factor other than 2 or 5 (3, 7, 60, ...) and its negative powers have no finite decimal form at
+// all. Only 2^a * 5^b bases divide a power of ten, so only they can be cleaned up by rounding to a
+// decimal place count: 2^-n needs n places, 4^-n needs 2n, 1024^-n needs 10n. Rounding any other
+// base to |exp| places (what uPlot's own generator does, since it only ever runs on bases 2 and 10)
+// truncates the magnitude instead — 16^-3 collapses to 0 — so those bases skip rounding entirely
+// and keep the raw float product, which is already the closest representable value.
+function decsPerNegExp(base: number): number | null {
+	if (!Number.isInteger(base) || base < 1) {
+		return null;
+	}
+	let rest = base;
+	let twos = 0;
+	let fives = 0;
+	while (rest % 2 === 0) {
+		rest /= 2;
+		twos++;
+	}
+	while (rest % 5 === 0) {
+		rest /= 5;
+		fives++;
+	}
+	return rest === 1 ? Math.max(twos, fives) : null;
 }
 
 /**
@@ -40,15 +73,28 @@ function roundDec(val: number, dec: number): number {
  * building a custom ladder those don't cover.
  *
  * @param base The exponent base — `10` for decimal ladders, `2` for binary (byte-multiple)
- *   ladders, etc.
- * @param minExp Smallest exponent, inclusive.
+ *   ladders, etc. Must be a finite positive number.
+ * @param minExp Smallest exponent, inclusive. Must be an integer.
  * @param maxExp Largest exponent, inclusive (unlike uPlot's own internal generator, where the
- *   upper bound is exclusive).
+ *   upper bound is exclusive). Must be an integer; a `maxExp` below `minExp` yields an empty
+ *   ladder.
  * @param mantissas Multipliers applied at every exponent, e.g. `[1, 2, 5]` for a strict
- *   1-2-5 ladder or `[1, 2, 2.5, 5]` to also land on quarter-decade steps.
+ *   1-2-5 ladder or `[1, 2, 2.5, 5]` to also land on quarter-decade steps. Must all be finite.
  * @returns A flat, ascending array of `mantissa * base^exp` values, ordered by exponent then
  *   by the order `mantissas` were given in. Not deduplicated — callers whose `mantissas`
- *   can coincide across exponents (rare) should dedupe themselves.
+ *   can coincide across exponents (rare) should dedupe themselves. Exponents that overflow to
+ *   `Infinity` or underflow to `0` are dropped, since neither is usable as an axis increment.
+ *
+ *   Values are exact round decimals when `base` is a product of 2s and 5s (2, 4, 5, 8, 10, 1024,
+ *   ...) — the ladders this package ships all are. Two limits are worth knowing before relying on
+ *   bit-exactness: any other base (3, 60, ...) has no finite decimal form at negative exponents,
+ *   so its rungs are the nearest representable float rather than an exact decimal; and the
+ *   rounding, which is uPlot's own, drifts a few ulps for binary magnitudes below 2^-21 (`2 ** -22`
+ *   comes back as `2.384185791015627e-7`). The drift is deliberately preserved rather than fixed:
+ *   uPlot pre-registers `genIncrs(2, -53, 53, [1])` in the internal `fixedDec` map it looks tick
+ *   decimals up in, so a "more correct" value here would simply miss that map.
+ * @throws {RangeError} If `base`, `minExp`, `maxExp` or any mantissa is outside the ranges above.
+ *   Unvalidated, `maxExp: Infinity` spins forever and a `NaN` argument silently poisons every rung.
  * @example
  * ```ts
  * import { incrsLadder } from 'uplot-kit';
@@ -63,31 +109,57 @@ export function incrsLadder(
 	maxExp: number,
 	mantissas: number[]
 ): number[] {
+	if (!Number.isFinite(base) || base <= 0) {
+		throw new RangeError(`incrsLadder: base must be a finite positive number, got ${base}`);
+	}
+	if (!Number.isInteger(minExp) || !Number.isInteger(maxExp)) {
+		throw new RangeError(
+			`incrsLadder: minExp and maxExp must be integers, got ${minExp} and ${maxExp}`
+		);
+	}
+	const badMantissa = mantissas.find((mantissa) => !Number.isFinite(mantissa));
+	if (badMantissa !== undefined) {
+		throw new RangeError(`incrsLadder: mantissas must be finite numbers, got ${badMantissa}`);
+	}
+
 	const incrs: number[] = [];
 	const mantissaDecs = mantissas.map(guessDec);
+	// String() switches to exponential notation outside [1e-6, 1e21), which the base-10
+	// string-concatenation path below cannot splice a second exponent into ('1e-7' + 'e-3').
+	const isPlainNotation = mantissas.map((mantissa) => !String(mantissa).includes('e'));
+	const negExpDecs = decsPerNegExp(base);
 
 	for (let exp = minExp; exp <= maxExp; exp++) {
-		const expAbs = Math.abs(exp);
-		const magnitude = roundDec(base ** exp, expAbs);
+		// Decimal places the magnitude needs: none for a non-negative exponent (an integer base
+		// raised to one is whole), |exp| per-exponent places for a negative one. null means this
+		// base has no exact decimal form to round onto (see decsPerNegExp) — then nothing in this
+		// iteration is rounded, and the raw products stand.
+		const magnitudeDec = negExpDecs === null ? null : Math.max(0, -exp) * negExpDecs;
+		const magnitude = magnitudeDec === null ? base ** exp : roundDec(base ** exp, magnitudeDec);
 
 		for (const [i, mantissa] of mantissas.entries()) {
-			if (base === 10) {
+			const mantissaDec = mantissaDecs[i] ?? 0;
+			if (base === 10 && isPlainNotation[i]) {
 				// Exact decimal literal via string concatenation: Number('2.5e-7') parses to the
 				// float nearest that decimal number directly, whereas 2.5 * 10 ** -7 accumulates
 				// two separate roundings (the power, then the product).
 				incrs.push(Number(`${mantissa}e${exp}`));
+			} else if (magnitudeDec === null) {
+				incrs.push(mantissa * magnitude);
 			} else {
-				// Decimal places the increment needs: |exp| for negative powers, plus the mantissa's
-				// own decimal places when the exponent hasn't already absorbed them (2.5 at exp 0 is
-				// one decimal place; at exp >= 1 it's already a whole number, e.g. 25).
-				const mantissaDec = mantissaDecs[i] ?? 0;
-				const dec = (exp >= 0 ? 0 : expAbs) + (exp >= mantissaDec ? 0 : mantissaDec);
-				incrs.push(roundDec(mantissa * magnitude, dec));
+				// The exact product has at most (magnitude's places + mantissa's own places)
+				// decimals — 2.5 * 2^-3 is 0.3125, four places — so rounding there only sheds
+				// float noise.
+				incrs.push(roundDec(mantissa * magnitude, magnitudeDec + mantissaDec));
 			}
 		}
 	}
 
-	return incrs;
+	// An increment of 0 or ±Infinity is never usable: uPlot's findIncr divides by the increment to
+	// derive tick spacing, so a 0 rung can never satisfy its minimum-space test (dead weight
+	// pushing the axis toward its no-ticks path) and a non-finite one poisons the comparison
+	// outright. Exponents far enough out to saturate float64 drop here instead of shipping.
+	return incrs.filter((incr) => Number.isFinite(incr) && incr !== 0);
 }
 
 // --- Ladders (private to this module) ---
@@ -237,15 +309,26 @@ const NANOSECOND_INCRS: readonly number[] = /* @__PURE__ */ buildNanosecondIncrs
 export interface IncrsOptions {
 	/**
 	 * Drops every increment below this value, so e.g. an axis for data bucketed no finer than a
-	 * minute never offers a sub-minute tick.
+	 * minute never offers a sub-minute tick. `NaN` (e.g. from a `Number(userInput)` that didn't
+	 * parse) falls back to the default rather than filtering everything out.
 	 * @default -Infinity (no floor)
 	 */
 	minIncr?: number;
 	/**
-	 * Drops every increment above this value.
+	 * Drops every increment above this value. `NaN` falls back to the default, as with
+	 * {@link IncrsOptions.minIncr}.
 	 * @default Infinity (no ceiling)
 	 */
 	maxIncr?: number;
+}
+
+// `incr >= NaN` and `incr <= NaN` are both false for every rung, so an unguarded NaN bound wouldn't
+// merely be ignored — it would empty the ladder, and an empty axis.incrs makes uPlot's findIncr
+// return no increment at all and the axis render no ticks whatsoever. A bound that isn't a number
+// therefore reverts to the documented default. `?? ` (not `||`) keeps a deliberate 0 bound.
+function incrsBound(value: number | undefined, fallback: number): number {
+	const bound = value ?? fallback;
+	return Number.isNaN(bound) ? fallback : bound;
 }
 
 // Always allocates a new array via filter — even when both bounds are left at their defaults —
@@ -254,8 +337,8 @@ export interface IncrsOptions {
 // chart's ticks. Private to this module — both the incrsFor* facades and incrsStep run their
 // ladders through it.
 function applyIncrsOptions(ladder: readonly number[], options: IncrsOptions | undefined): number[] {
-	const minIncr = options?.minIncr ?? -Infinity;
-	const maxIncr = options?.maxIncr ?? Infinity;
+	const minIncr = incrsBound(options?.minIncr, -Infinity);
+	const maxIncr = incrsBound(options?.maxIncr, Infinity);
 	return ladder.filter((incr) => incr >= minIncr && incr <= maxIncr);
 }
 
@@ -479,6 +562,7 @@ const INCRS_FACADES: Record<IncrsByUnitKind, (options?: IncrsOptions) => number[
  *   `'bit'`, `'integer'`, `'second'`, `'millisecond'`, `'microsecond'`, `'nanosecond'`), or a
  *   custom ascending, duplicate-free array of increments.
  * @param options Applied to both built-in and custom ladders alike.
+ * @throws {TypeError} If `kind` is a string that names no built-in family.
  * @example
  * ```ts
  * import uPlot from 'uplot';
@@ -495,6 +579,17 @@ const INCRS_FACADES: Record<IncrsByUnitKind, (options?: IncrsOptions) => number[
 export function incrsByUnit(kind: IncrsByUnitKind | number[], options?: IncrsOptions): number[] {
 	if (Array.isArray(kind)) {
 		return applyIncrsOptions(kind, options);
+	}
+	// An own-property check, not a bare lookup: this is the one function in the module built to
+	// take a string that is only known at runtime, so `kind` may well be unvalidated. A bare lookup
+	// resolves inherited Object.prototype members too — incrsByUnit('valueOf') would call
+	// Object.prototype.valueOf on the facade map and hand the caller the shared, mutable singleton
+	// itself (typed as number[]), from which a single delete breaks every chart in the process.
+	if (!Object.hasOwn(INCRS_FACADES, kind)) {
+		const known = Object.keys(INCRS_FACADES).join(', ');
+		throw new TypeError(
+			`incrsByUnit: unknown unit ${JSON.stringify(kind)} — expected one of ${known}, or an array of increments.`
+		);
 	}
 	return INCRS_FACADES[kind](options);
 }
@@ -543,8 +638,14 @@ export interface IncrsStepOptions extends IncrsOptions {
  */
 export function incrsStep(step: number, options: IncrsStepOptions = {}): number[] {
 	const { mults = INTEGER_INCRS, ...incrsOptions } = options;
+	const stepDec = guessDec(step);
 	return applyIncrsOptions(
-		mults.map((mult) => mult * step),
+		// Rounded like every other ladder in this module, not the raw product: 25 * 1.1 is
+		// 27.500000000000004, and uPlot both derives a label's decimal count from the increment
+		// and steps splits by it, so a dirty increment prints verbatim through any custom
+		// axis.values (the byte/duration formatters this package exists for). The exact product
+		// has at most (step's decimals + mult's decimals) places, so this only sheds float noise.
+		mults.map((mult) => roundDec(mult * step, stepDec + guessDec(mult))),
 		incrsOptions
 	);
 }

@@ -4,48 +4,24 @@
 // only entry point — `uplot-kit` is the single public specifier. Consumers
 // name-import from the root and rely on tree-shaking to drop what they don't use;
 // per-plugin subpaths would only earn their keep for no-bundler/CDN consumption.
-//
-// Planned for v0.1:
-//   plugins: autosize, axisSync, timeRegions, verticalMarker, timeSelection,
-//            boxZoom, seriesFocus
 
 export {
-  incrsByUnit,
-  incrsForBits,
-  incrsForBytes,
-  incrsForIntegers,
-  incrsForKilobytes,
-  incrsForMegabytes,
-  incrsForMicroseconds,
-  incrsForMilliseconds,
-  incrsForNanoseconds,
-  incrsForSeconds,
-  incrsLadder,
-  incrsStep,
-  type IncrsByUnitKind,
-  type IncrsOptions,
-  type IncrsStepOptions
+	incrsByUnit,
+	incrsForBits,
+	incrsForBytes,
+	incrsForIntegers,
+	incrsForKilobytes,
+	incrsForMegabytes,
+	incrsForMicroseconds,
+	incrsForMilliseconds,
+	incrsForNanoseconds,
+	incrsForSeconds,
+	incrsLadder,
+	incrsStep,
+	type IncrsByUnitKind,
+	type IncrsOptions,
+	type IncrsStepOptions
 } from './incrs';
-
-export {
-  // generators: Options => SplitsFn
-  splitsForCategory,
-  splitsForLog,
-  splitsForStep,
-  splitsForTime,
-  // decorators: SplitsFn => SplitsFn
-  splitsWithEdges,
-  splitsWithFilter,
-  splitsWithInclude,
-  splitsWithLimit,
-  type SplitsFn,
-  type SplitsForCategoryOptions,
-  type SplitsForLogOptions,
-  type SplitsForStepOptions,
-  type SplitsForTimeGranularity,
-  type SplitsForTimeOptions,
-  type SplitsWithEdgesOptions
-} from './splits';
 
 export {
 	// generators: Options => SplitsFn
