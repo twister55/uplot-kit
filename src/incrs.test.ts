@@ -85,7 +85,8 @@ describe('incrsLadder', () => {
 	it('handles a mantissa that only has an exponential string form', () => {
 		// String(1e-7) is '1e-7', and the base-10 fast path builds its literal by concatenation --
 		// '1e-7' + 'e-3' is unparseable, and every such mantissa used to come back NaN.
-		expect(incrsLadder(10, -3, -3, [1, 1e-7, 1e21])).toStrictEqual([0.001, 1e-10, 1e18]);
+		// Sorted ascending, not in mantissa order: see the ordering test below.
+		expect(incrsLadder(10, -3, -3, [1, 1e-7, 1e21])).toStrictEqual([1e-10, 0.001, 1e18]);
 	});
 
 	it('drops exponents that saturate float64 instead of shipping Infinity or 0', () => {
@@ -130,12 +131,31 @@ describe('incrsLadder', () => {
 		}
 	});
 
-	it('orders results by exponent then by mantissa order, ascending for positive mantissas', () => {
-		const incrs = incrsLadder(10, 0, 2, [1, 2, 5]);
-		incrs.reduce((previous, current) => {
-			expect(current).toBeGreaterThan(previous);
-			return current;
-		});
+	it('sorts ascending even when generation order interleaves', () => {
+		// Generation is exponent-major, so any mantissa at or above the base produces a rung larger
+		// than the next exponent's first one: base 2 with [1, 2, 5] emitted 1,2,5,2,4,10,... uPlot's
+		// findIncr seeds with closestIdx (a binary search) and then only walks forward, so on that
+		// ladder every rung before the seed was unreachable -- a [5,2,1] ordering picks 50 where 5
+		// was right, and a descending one picks nothing at all.
+		expect(incrsLadder(2, 0, 4, [1, 2, 5])).toStrictEqual([1, 2, 4, 5, 8, 10, 16, 20, 32, 40, 80]);
+		expect(incrsLadder(10, 0, 3, [1, 25])).toStrictEqual([1, 10, 25, 100, 250, 1000, 2500, 25000]);
+	});
+
+	it('sorts a base below one, whose exponents descend', () => {
+		// "A finite positive number" admits base < 1, where a rising exponent shrinks the rung.
+		expect(incrsLadder(0.5, 0, 3, [1])).toStrictEqual([0.125, 0.25, 0.5, 1]);
+	});
+
+	it('deduplicates rungs that coincide across exponents', () => {
+		// 2 * 2^0 and 1 * 2^1 are the same increment; a duplicate is a wasted step of findIncr's
+		// forward walk, and the ladders this feeds are documented as duplicate-free.
+		expect(incrsLadder(2, 0, 2, [1, 2])).toStrictEqual([1, 2, 4, 8]);
+	});
+
+	it('drops a negative mantissa rather than shipping a backwards increment', () => {
+		// The argument guard only asks for finiteness, so a negative mantissa reaches the loop --
+		// and findIncr divides by the increment, so its rungs would space the axis backwards.
+		expect(incrsLadder(10, 0, 1, [-2, 1])).toStrictEqual([1, 10]);
 	});
 });
 
@@ -278,8 +298,19 @@ describe('incrsFor* facades', () => {
 			expect(Math.max(...incrsForSeconds({ maxIncr: 3600 }))).toBe(3600);
 		});
 
-		it('returns an empty array (not a throw) when the bounds admit nothing', () => {
-			expect(incrsForSeconds({ minIncr: 1, maxIncr: 0 })).toStrictEqual([]);
+		it('returns an empty array (not a throw) when the bounds admit nothing, and says so', () => {
+			// uPlot does not read an empty axis.incrs as "use the default ladder" -- `axis.incrs ||
+			// defaults` keeps it, because an empty array is truthy -- so findIncr returns [0, 0] and
+			// axesCalc bails before sizing the axis: a blank gutter with no ticks and no gridlines.
+			// The bounds are the realistic cause and nothing else on the console names them.
+			const warn = vi.spyOn(console, 'warn').mockImplementation(() => {});
+			try {
+				expect(incrsForSeconds({ minIncr: 1, maxIncr: 0 })).toStrictEqual([]);
+				expect(warn).toHaveBeenCalledOnce();
+				expect(warn.mock.calls[0]?.[0]).toContain('no increment is both >= minIncr 1');
+			} finally {
+				warn.mockRestore();
+			}
 		});
 
 		it('warns about a NaN bound and ignores it instead of emptying the ladder', () => {
@@ -323,6 +354,46 @@ describe('incrsByUnit', () => {
 	it('applies IncrsOptions to a custom array too', () => {
 		const custom = [1, 2, 4, 8, 16];
 		expect(incrsByUnit(custom, { minIncr: 4, maxIncr: 8 })).toStrictEqual([4, 8]);
+	});
+
+	// This branch takes its ladder straight from a chart config, where nothing has checked it --
+	// and every bad shape below fails as a mis-ticked or blank axis rather than as an error.
+	describe('custom array hygiene', () => {
+		it('sorts an out-of-order array and says so, without touching the caller ', () => {
+			const warn = vi.spyOn(console, 'warn').mockImplementation(() => {});
+			try {
+				const custom = [5, 2, 1];
+				expect(incrsByUnit(custom)).toStrictEqual([1, 2, 5]);
+				expect(custom).toStrictEqual([5, 2, 1]);
+				expect(warn).toHaveBeenCalledOnce();
+				expect(warn.mock.calls[0]?.[0]).toContain('not in ascending order');
+			} finally {
+				warn.mockRestore();
+			}
+		});
+
+		it('drops values that cannot be increments and says how many', () => {
+			const warn = vi.spyOn(console, 'warn').mockImplementation(() => {});
+			try {
+				// Three bad values that used to have three different outcomes: Infinity and 0 passed
+				// straight through to axis.incrs, NaN was deleted only incidentally (`NaN >= -Infinity`
+				// is false), and a negative spaced the axis backwards.
+				expect(incrsByUnit([Infinity, 0, NaN, -5, 5, 1])).toStrictEqual([1, 5]);
+				expect(warn.mock.calls[0]?.[0]).toContain('dropped 4 of 6 increments');
+			} finally {
+				warn.mockRestore();
+			}
+		});
+
+		it('deduplicates quietly, since a duplicate misticks nothing', () => {
+			const warn = vi.spyOn(console, 'warn').mockImplementation(() => {});
+			try {
+				expect(incrsByUnit([1, 1, 2, 2])).toStrictEqual([1, 2]);
+				expect(warn).not.toHaveBeenCalled();
+			} finally {
+				warn.mockRestore();
+			}
+		});
 	});
 
 	// This is the module's runtime-dispatch entry point, so its argument is exactly the one that
@@ -396,8 +467,16 @@ describe('incrsStep', () => {
 		});
 	});
 
-	it('uses custom mults verbatim, in the given order, scaled by step', () => {
+	it('uses custom mults scaled by step', () => {
 		expect(incrsStep(900, { mults: [1, 4, 16, 96] })).toStrictEqual([900, 3600, 14400, 86400]);
+	});
+
+	it('sorts out-of-order mults rather than handing uPlot an unsearchable ladder', () => {
+		// findIncr binary-searches axis.incrs and then only walks forward, so [5, 2, 1] used to make
+		// the two smaller rungs unreachable. Sorting is announced by the shared `incrs` warn-once
+		// tracker, which is module-scoped -- another test may already have spent that message, so
+		// this asserts the repair, not the warning.
+		expect(incrsStep(900, { mults: [5, 2, 1] })).toStrictEqual([900, 1800, 4500]);
 	});
 
 	it('applies IncrsOptions on top of the scaled ladder', () => {

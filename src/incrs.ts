@@ -54,6 +54,21 @@ function decsPerNegExp(base: number): number | null {
 	return rest === 1 ? Math.max(twos, fives) : null;
 }
 
+// Ascending and duplicate-free, the shape uPlot's findIncr() assumes of `axis.incrs` without its
+// type saying so: findIncr seeds its search with closestIdx(), a binary search, and from there only
+// ever walks *forward*. A rung sitting before that seed in an unsorted ladder is unreachable — a
+// [5, 2, 1] ladder picks 50 where 5 was right, and a wholly descending one picks nothing at all —
+// and a duplicate is a wasted step of that same walk.
+//
+// Sorts in place, so callers must pass an array they own (both do: one filters first, the other
+// built it). Kept separate from sanitizeIncrs below because this is the silent half — the engine's
+// own exponent-major generation order is not a caller mistake to report.
+function ascendingUnique(values: number[]): number[] {
+	values.sort((a, b) => a - b);
+	// `values[-1]` is undefined, which no number equals, so index 0 always survives.
+	return values.filter((incr, index) => incr !== values[index - 1]);
+}
+
 /**
  * Generates a "nice" increment ladder as `mantissa * base^exp` for every exponent in
  * `[minExp, maxExp]` and every mantissa in `mantissas`, with the same float-precision
@@ -72,10 +87,14 @@ function decsPerNegExp(base: number): number | null {
  *   ladder.
  * @param mantissas Multipliers applied at every exponent, e.g. `[1, 2, 5]` for a strict
  *   1-2-5 ladder or `[1, 2, 2.5, 5]` to also land on quarter-decade steps. Must all be finite.
- * @returns A flat, ascending array of `mantissa * base^exp` values, ordered by exponent then
- *   by the order `mantissas` were given in. Not deduplicated — callers whose `mantissas`
- *   can coincide across exponents (rare) should dedupe themselves. Exponents that overflow to
- *   `Infinity` or underflow to `0` are dropped, since neither is usable as an axis increment.
+ * @returns A flat array of `mantissa * base^exp` values, sorted ascending and deduplicated.
+ *   Generation is exponent-major, which interleaves as soon as a mantissa reaches `base` — base 2
+ *   with `[1, 2, 5]` produces 5 before the next exponent's 2 — so the result is sorted rather than
+ *   handed back in that order: uPlot's `findIncr` binary-searches `axis.incrs` and then only walks
+ *   forward, so a rung before that seed would be unreachable. A `mantissas` set that can coincide
+ *   across exponents therefore yields fewer rungs than `mantissas.length * exponents`. Values that
+ *   are not finite and above zero are dropped — an exponent that overflowed to `Infinity` or
+ *   underflowed to `0`, or a negative mantissa — since `findIncr` divides by the increment.
  *
  *   Values are exact round decimals when `base` is a product of 2s and 5s (2, 4, 5, 8, 10, 1024,
  *   ...) — the ladders this package ships all are. Two limits are worth knowing before relying on
@@ -156,11 +175,13 @@ export function incrsLadder(
 		}
 	}
 
-	// An increment of 0 or ±Infinity is never usable: uPlot's findIncr divides by the increment to
-	// derive tick spacing, so a 0 rung can never satisfy its minimum-space test (dead weight
-	// pushing the axis toward its no-ticks path) and a non-finite one poisons the comparison
-	// outright. Exponents far enough out to saturate float64 drop here instead of shipping.
-	return incrs.filter((incr) => Number.isFinite(incr) && incr !== 0);
+	// An increment that is not above zero and finite is never usable: uPlot's findIncr divides by the
+	// increment to derive tick spacing, so a 0 rung can never satisfy its minimum-space test (dead
+	// weight pushing the axis toward its no-ticks path), a non-finite one poisons the comparison
+	// outright, and a negative one — reachable from a negative mantissa, which the finiteness guard
+	// above admits — yields negative spacing. Exponents far enough out to saturate float64 drop here
+	// instead of shipping. Sorting is the other half; see ascendingUnique.
+	return ascendingUnique(incrs.filter(isPositiveFinite));
 }
 
 // --- Ladders (private to this module) ---
@@ -312,12 +333,16 @@ export interface IncrsOptions {
 	 * Drops every increment below this value, so e.g. an axis for data bucketed no finer than a
 	 * minute never offers a sub-minute tick. `NaN` (e.g. from a `Number(userInput)` that didn't
 	 * parse) falls back to the default rather than filtering everything out.
+	 *
+	 * A bound pair that admits nothing — a floor above the top of the ladder, or above `maxIncr` —
+	 * yields an empty array, which uPlot does *not* read as "use the default ladder": that axis
+	 * renders no ticks and no gridlines while still reserving its gutter. It is warned about once.
 	 * @default -Infinity (no floor)
 	 */
 	minIncr?: number;
 	/**
-	 * Drops every increment above this value. `NaN` falls back to the default, as with
-	 * {@link IncrsOptions.minIncr}.
+	 * Drops every increment above this value. `NaN` falls back to the default, and a pair admitting
+	 * nothing blanks the axis, both as with {@link IncrsOptions.minIncr}.
 	 * @default Infinity (no ceiling)
 	 */
 	maxIncr?: number;
@@ -337,15 +362,60 @@ function incrsBound(name: string, value: number | undefined, fallback: number): 
 	return optionOr(warnOptions, name, bound, !Number.isNaN(bound), 'a number', fallback);
 }
 
-// Always allocates a new array via filter — even when both bounds are left at their defaults —
-// so every incrsFor*/incrsByUnit/incrsStep call returns a caller-owned array. Returning the
-// shared module-level ladder directly would let one consumer's mutation corrupt every other
-// chart's ticks. Private to this module — both the incrsFor* facades and incrsStep run their
-// ladders through it.
+// The reporting half of ascendingUnique, for a ladder that did not come from incrsLadder: the array
+// branch of incrsByUnit takes one straight from a chart config, and incrsStep scales one from a
+// caller's `mults`. Neither is checked by anything else, and every way of getting it wrong fails as
+// a mis-ticked or blank axis rather than as an error, so the fix is announced under the package's
+// usual policy — name it, say it once, carry on with the repaired value.
+function sanitizeIncrs(ladder: readonly number[]): number[] {
+	// filter() copies, so the in-place sort inside ascendingUnique never reorders a caller's array.
+	const usable = ladder.filter(isPositiveFinite);
+	if (usable.length < ladder.length) {
+		warnOptions(
+			`dropped ${ladder.length - usable.length} of ${ladder.length} increments that are not ` +
+				'finite and above zero — findIncr divides by the increment, so none of those can tick'
+		);
+	}
+
+	const outOfOrder = usable.some((incr, index) => {
+		const previous = usable[index - 1];
+		return previous !== undefined && incr < previous;
+	});
+	if (outOfOrder) {
+		warnOptions(
+			'increments were not in ascending order and have been sorted — findIncr binary-searches ' +
+				'axis.incrs and then only walks forward, so a rung before that seed is unreachable and ' +
+				'the axis silently ticks too coarsely, or not at all'
+		);
+	}
+
+	// Duplicates go quietly, unlike the two above: uPlot only wastes a step of that forward walk on
+	// them, so removing one repairs nothing the caller needs to hear about.
+	return ascendingUnique(usable);
+}
+
+// Always allocates a new array — even when both bounds are left at their defaults — so every
+// incrsFor*/incrsByUnit/incrsStep call returns a caller-owned array. Returning the shared
+// module-level ladder directly would let one consumer's mutation corrupt every other chart's ticks.
+// Private to this module — both the incrsFor* facades and incrsStep run their ladders through it.
 function applyIncrsOptions(ladder: readonly number[], options: IncrsOptions | undefined): number[] {
 	const minIncr = incrsBound('minIncr', options?.minIncr, -Infinity);
 	const maxIncr = incrsBound('maxIncr', options?.maxIncr, Infinity);
-	return ladder.filter((incr) => incr >= minIncr && incr <= maxIncr);
+	const bounded = sanitizeIncrs(ladder).filter((incr) => incr >= minIncr && incr <= maxIncr);
+	// An empty axis.incrs is not "use uPlot's default": `axis.incrs || defaults` keeps an empty
+	// array because it is truthy, findIncr then finds nothing and returns [0, 0], and axesCalc
+	// bails before sizing the axis — leaving a blank gutter with no ticks, no gridlines and, until
+	// this warning, nothing at all on the console to say why. The bounds are named because the
+	// realistic way to get here is a pair that admits nothing (minIncr above maxIncr, or a floor
+	// past the top of the ladder), which reads as an ordinary filter right up until the axis
+	// disappears.
+	if (bounded.length === 0) {
+		warnOptions(
+			`no increment is both >= minIncr ${minIncr} and <= maxIncr ${maxIncr} — an empty ` +
+				'axis.incrs renders no ticks at all rather than falling back to the uPlot default'
+		);
+	}
+	return bounded;
 }
 
 /**
@@ -566,7 +636,11 @@ const INCRS_FACADES: Record<IncrsByUnitKind, (options?: IncrsOptions) => number[
  *
  * @param kind Either one of the built-in families (`'byte'`, `'kilobyte'`, `'megabyte'`,
  *   `'bit'`, `'integer'`, `'second'`, `'millisecond'`, `'microsecond'`, `'nanosecond'`), or a
- *   custom ascending, duplicate-free array of increments.
+ *   custom array of increments. A custom array is sorted ascending, de-duplicated, and stripped of
+ *   values that are not finite and above zero, rather than trusted: this is the entry point whose
+ *   argument arrives unchecked from a chart config, and each of those shapes otherwise fails as a
+ *   mis-ticked or blank axis. The repairs that matter are warned about once. The array is copied,
+ *   never sorted in place.
  * @param options Applied to both built-in and custom ladders alike.
  * @returns The named family's ladder, or an empty array for a `kind` that names no built-in
  *   family — warned about once on the console rather than thrown, since this is precisely the
@@ -610,7 +684,10 @@ export function incrsByUnit(kind: IncrsByUnitKind | number[], options?: IncrsOpt
 
 export interface IncrsStepOptions extends IncrsOptions {
 	/**
-	 * Whole multiples of `step` to offer as increments, in ascending order.
+	 * Whole multiples of `step` to offer as increments. Order does not matter — the scaled products
+	 * are sorted ascending and de-duplicated, since uPlot binary-searches `axis.incrs` (see
+	 * {@link incrsLadder}) — but a set given out of order is warned about once, because an
+	 * unsorted list is far more often a mistake than an intent.
 	 * @default The built-in whole-number ladder (1, 2, 5, 10, 20, 25, 50, ...) — see
 	 *   {@link incrsForIntegers}.
 	 */
@@ -630,10 +707,11 @@ export interface IncrsStepOptions extends IncrsOptions {
  *   buckets expressed in seconds. Required and has no default — a bucket ladder with no bucket
  *   size is not a ladder — so a value that is not finite and above zero warns once and yields no
  *   increments, the same answer `splitsForStep` gives an unusable `step`.
- * @returns The `mults` scaled by `step`, in the order given, with any product that is not a usable
- *   increment (`0`, or one that overflowed to `Infinity`) dropped and reported once — the same
- *   filter {@link incrsLadder} applies to its own rungs, since uPlot's `findIncr` divides by the
- *   increment.
+ * @returns The `mults` scaled by `step`, sorted ascending and de-duplicated — not in the order
+ *   given, since uPlot's `findIncr` binary-searches `axis.incrs` (see {@link incrsLadder}) — with
+ *   any product that is not a usable increment (`0`, a negative, or one that overflowed to
+ *   `Infinity`) dropped and reported once, the same filter {@link incrsLadder} applies to its own
+ *   rungs.
  * @example
  * ```ts
  * import uPlot from 'uplot';
@@ -672,14 +750,16 @@ export function incrsStep(step: number, options: IncrsStepOptions = {}): number[
 	// has at most (step's decimals + mult's decimals) places, so this only sheds float noise.
 	const scaled = mults.map((mult) => roundDec(mult * step, stepDec + fractionDigits(mult)));
 	// The same final filter incrsLadder applies to its own rungs, for the same reason: findIncr
-	// divides by the increment, so a 0 rung can never satisfy its minimum-space test and a
-	// non-finite one poisons the comparison. Unlike incrsLadder's, these come straight from a
-	// caller's `mults` rather than from an exponent that saturated, so the drop is reported.
-	const usable = scaled.filter((incr) => Number.isFinite(incr) && incr !== 0);
+	// divides by the increment, so a 0 rung can never satisfy its minimum-space test, a non-finite
+	// one poisons the comparison and a negative one spaces backwards. Unlike incrsLadder's, these
+	// come straight from a caller's `mults` rather than from an exponent that saturated, so the drop
+	// is reported here — and reported in terms of `mults`, which is what the caller can act on,
+	// rather than through sanitizeIncrs' generic increment wording downstream.
+	const usable = scaled.filter(isPositiveFinite);
 	if (usable.length < scaled.length) {
 		warnStep(
 			`dropped ${scaled.length - usable.length} of ${scaled.length} mults whose product with ` +
-				'step is zero or not finite — those are not usable as increments'
+				'step is not finite and above zero — those are not usable as increments'
 		);
 	}
 	return applyIncrsOptions(usable, incrsOptions);
