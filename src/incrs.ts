@@ -54,6 +54,66 @@ function decsPerNegExp(base: number): number | null {
 	return rest === 1 ? Math.max(twos, fives) : null;
 }
 
+// Exponents an incrsLadder call may span. Not a tick budget the way splits.ts's cap is — the loop
+// itself is the cost here, since a ladder this long is refused rather than walked.
+const MAX_LADDER_EXPONENTS = 10_000;
+
+// Below this, String() writes a number in exponential notation ('1e-7', not '0.0000001'), which is
+// where uPlot's decimal-count guess breaks down. See isSteppableIncr.
+const EXPONENTIAL_NOTATION_FLOOR = 1e-6;
+
+// uPlot's pre-registered decimal counts for increments below EXPONENTIAL_NOTATION_FLOOR, mirrored
+// because nothing in uPlot exposes the map to ask. Built on first need: a ladder that never goes
+// sub-microsecond — every byte, bit and integer ladder here — never pays for it.
+let uplotSteppableSmallIncrs: Set<number> | null = null;
+
+// Whether uPlot can actually *step* by this increment, which is not the same question as whether it
+// can pick it. numAxisSplits advances its loop variable with `roundDec(val + foundIncr, numDec)`,
+// where numDec is what uPlot recorded for that increment in its internal fixedDec map. For a static
+// `axis.incrs` array it records `guessDec(incr)` — the digits after the '.' in String(incr) — which
+// is 0 for anything below 1e-6, where String() switches to exponential notation. roundDec(3e-7, 0)
+// is 0, so `val` never moves: an unbounded splits.push that locks the browser tab, not a wrong axis.
+//
+// The escape is that uPlot pre-registers two families at module load whose decimal count comes from
+// genIncrs' own arithmetic instead of from guessDec, and those step correctly. Everything else below
+// the floor does not, and there is no way to register one from outside the library — so a rung there
+// is dropped and the caller is pointed at axis.splits, which has no such limitation.
+function isSteppableIncr(incr: number): boolean {
+	if (incr >= EXPONENTIAL_NOTATION_FLOOR) {
+		return true;
+	}
+	uplotSteppableSmallIncrs ??= new Set([
+		// uPlot.esm.js:988, `decIncrs` — genIncrs(10, -32, 0, [1, 2, 2.5, 5]); exponents above -7
+		// land at or above the floor and need no entry.
+		...generateLadder(10, -32, -7, [1, 2, 2.5, 5]),
+		// uPlot.esm.js:1187 — a bare genIncrs(2, -53, 53, [1]) whose only purpose is this map. 2^-20
+		// is the largest power of two under the floor. These are the values incrsLadder deliberately
+		// reproduces drift and all (see its @returns), which is what makes them match as Set keys.
+		...generateLadder(2, -53, -20, [1])
+	]);
+	return uplotSteppableSmallIncrs.has(incr);
+}
+
+// Drops what isSteppableIncr rejects, naming the values: they are the actionable part, and the
+// remedy is a different uPlot option rather than a different argument.
+function steppableIncrs(values: number[], warn: (detail: string) => void): number[] {
+	const steppable: number[] = [];
+	const dropped: number[] = [];
+	for (const incr of values) {
+		(isSteppableIncr(incr) ? steppable : dropped).push(incr);
+	}
+	if (dropped.length > 0) {
+		const named = dropped.slice(0, 3).join(', ');
+		warn(
+			`dropped ${dropped.length} increment(s) below ${EXPONENTIAL_NOTATION_FLOOR} that uPlot ` +
+				`cannot step by (${named}${dropped.length > 3 ? ', …' : ''}) — it reads their decimal ` +
+				'count as 0 and would loop forever building splits. To tick at that spacing, set ' +
+				'axis.splits to splitsForStep({ step }) instead of driving it through axis.incrs'
+		);
+	}
+	return steppable;
+}
+
 // Ascending and duplicate-free, the shape uPlot's findIncr() assumes of `axis.incrs` without its
 // type saying so: findIncr seeds its search with closestIdx(), a binary search, and from there only
 // ever walks *forward*. A rung sitting before that seed in an unsorted ladder is unreachable — a
@@ -81,10 +141,10 @@ function ascendingUnique(values: number[]): number[] {
  *
  * @param base The exponent base — `10` for decimal ladders, `2` for binary (byte-multiple)
  *   ladders, etc. Must be a finite positive number.
- * @param minExp Smallest exponent, inclusive. Must be an integer.
+ * @param minExp Smallest exponent, inclusive. Must be a safe integer.
  * @param maxExp Largest exponent, inclusive (unlike uPlot's own internal generator, where the
- *   upper bound is exclusive). Must be an integer; a `maxExp` below `minExp` yields an empty
- *   ladder.
+ *   upper bound is exclusive). Must be a safe integer, and within 10000 exponents of `minExp`; a
+ *   `maxExp` below `minExp` yields an empty ladder.
  * @param mantissas Multipliers applied at every exponent, e.g. `[1, 2, 5]` for a strict
  *   1-2-5 ladder or `[1, 2, 2.5, 5]` to also land on quarter-decade steps. Must all be finite.
  * @returns A flat array of `mantissa * base^exp` values, sorted ascending and deduplicated.
@@ -96,6 +156,13 @@ function ascendingUnique(values: number[]): number[] {
  *   are not finite and above zero are dropped — an exponent that overflowed to `Infinity` or
  *   underflowed to `0`, or a negative mantissa — since `findIncr` divides by the increment.
  *
+ *   Rungs below 1e-6 are dropped too, unless they are ones uPlot pre-registers (`1`/`2`/`2.5`/`5`
+ *   per decade, and powers of two): below that magnitude `String()` writes a number in exponential
+ *   notation, uPlot reads its decimal count as 0, and `numAxisSplits` then never advances its loop
+ *   variable — an unbounded push that locks the browser tab rather than mis-ticking an axis. So
+ *   `[1, 3]` at exponent -7 keeps `1e-7` and drops `3e-7`, saying so once. To tick at a spacing
+ *   uPlot cannot step by, drive `axis.splits` with {@link splitsForStep} instead of `axis.incrs`.
+ *
  *   Values are exact round decimals when `base` is a product of 2s and 5s (2, 4, 5, 8, 10, 1024,
  *   ...) — the ladders this package ships all are. Two limits are worth knowing before relying on
  *   bit-exactness: any other base (3, 60, ...) has no finite decimal form at negative exponents,
@@ -105,8 +172,10 @@ function ascendingUnique(values: number[]): number[] {
  *   uPlot pre-registers `genIncrs(2, -53, 53, [1])` in the internal `fixedDec` map it looks tick
  *   decimals up in, so a "more correct" value here would simply miss that map.
  *   An argument outside the ranges above warns once on the console and yields an empty ladder,
- *   rather than throwing: unvalidated, `maxExp: Infinity` spins forever and a `NaN` argument
- *   silently poisons every rung, but neither has an honest substitute to fall back to, and a
+ *   rather than throwing: unvalidated, an exponent bound that is `Infinity`, at or above `2 ** 53`
+ *   (where `exp++` is a no-op), or merely very far from its partner hangs the UI thread, and a
+ *   `NaN` argument silently poisons every rung — but none has an honest substitute to fall back to,
+ *   and a
  *   config-driven mistake should not take the whole chart down with it. Note that an empty
  *   `axis.incrs` leaves uPlot's `findIncr` with no increment to pick, so that axis renders no
  *   ticks — the console warning is what points at the cause.
@@ -132,8 +201,26 @@ export function incrsLadder(
 		warnLadder(`base must be a finite positive number, got ${base} — no increments`);
 		return [];
 	}
-	if (!Number.isInteger(minExp) || !Number.isInteger(maxExp)) {
-		warnLadder(`minExp and maxExp must be integers, got ${minExp} and ${maxExp} — no increments`);
+	// Safe integers, not merely integers: Number.isInteger admits 2 ** 53 and every magnitude above
+	// it, where `exp++` rounds straight back to the value it started from and the loop below cannot
+	// terminate at all — a request for five rungs spins until the heap dies, on the UI thread. The
+	// Infinity case the sentence in @returns describes is only the loud half of that.
+	if (!Number.isSafeInteger(minExp) || !Number.isSafeInteger(maxExp)) {
+		warnLadder(
+			`minExp and maxExp must be safe integers, got ${minExp} and ${maxExp} — no increments`
+		);
+		return [];
+	}
+	// A span the loop *can* finish is still not one anyone can wait for, so it is bounded on the same
+	// rule splits.ts applies to a too-dense tick grid: refuse outright rather than spend the frame
+	// producing something unusable. Base 2 needs 2098 exponents to cover every magnitude a double can
+	// represent, and every larger base needs fewer, so this only bites a base so close to 1 that the
+	// ladder would be thousands of near-identical rungs — which findIncr walks linearly.
+	if (maxExp - minExp >= MAX_LADDER_EXPONENTS) {
+		warnLadder(
+			`minExp and maxExp span more than ${MAX_LADDER_EXPONENTS} exponents ` +
+				`(${minExp} to ${maxExp}) — use a base further from 1, or a narrower range`
+		);
 		return [];
 	}
 	const badMantissa = mantissas.find((mantissa) => !Number.isFinite(mantissa));
@@ -142,6 +229,24 @@ export function incrsLadder(
 		return [];
 	}
 
+	return ascendingUnique(
+		steppableIncrs(
+			generateLadder(base, minExp, maxExp, mantissas).filter(isPositiveFinite),
+			warnLadder
+		)
+	);
+}
+
+// The raw `mantissa * base^exp` sweep, with none of incrsLadder's argument guards and none of its
+// output hygiene. Split out because the safe-increment table in isSteppableIncr is itself built from
+// two ladders, and routing those back through incrsLadder would re-enter isSteppableIncr while its
+// table is still being built.
+function generateLadder(
+	base: number,
+	minExp: number,
+	maxExp: number,
+	mantissas: number[]
+): number[] {
 	const incrs: number[] = [];
 	const mantissaDecs = mantissas.map(fractionDigits);
 	// String() switches to exponential notation outside [1e-6, 1e21), which the base-10
@@ -175,13 +280,7 @@ export function incrsLadder(
 		}
 	}
 
-	// An increment that is not above zero and finite is never usable: uPlot's findIncr divides by the
-	// increment to derive tick spacing, so a 0 rung can never satisfy its minimum-space test (dead
-	// weight pushing the axis toward its no-ticks path), a non-finite one poisons the comparison
-	// outright, and a negative one — reachable from a negative mantissa, which the finiteness guard
-	// above admits — yields negative spacing. Exponents far enough out to saturate float64 drop here
-	// instead of shipping. Sorting is the other half; see ascendingUnique.
-	return ascendingUnique(incrs.filter(isPositiveFinite));
+	return incrs;
 }
 
 // --- Ladders (private to this module) ---
@@ -377,8 +476,13 @@ function sanitizeIncrs(ladder: readonly number[]): number[] {
 		);
 	}
 
-	const outOfOrder = usable.some((incr, index) => {
-		const previous = usable[index - 1];
+	// Applied here as well as inside incrsLadder, because these two entry points are where a rung
+	// arrives without having passed through it: a caller's own array, and a caller's `mults` scaled
+	// by a step. A ladder that came from incrsLadder has nothing left to drop.
+	const steppable = steppableIncrs(usable, warnOptions);
+
+	const outOfOrder = steppable.some((incr, index) => {
+		const previous = steppable[index - 1];
 		return previous !== undefined && incr < previous;
 	});
 	if (outOfOrder) {
@@ -389,9 +493,9 @@ function sanitizeIncrs(ladder: readonly number[]): number[] {
 		);
 	}
 
-	// Duplicates go quietly, unlike the two above: uPlot only wastes a step of that forward walk on
+	// Duplicates go quietly, unlike the three above: uPlot only wastes a step of that forward walk on
 	// them, so removing one repairs nothing the caller needs to hear about.
-	return ascendingUnique(usable);
+	return ascendingUnique(steppable);
 }
 
 // Always allocates a new array — even when both bounds are left at their defaults — so every
@@ -711,7 +815,10 @@ export interface IncrsStepOptions extends IncrsOptions {
  *   given, since uPlot's `findIncr` binary-searches `axis.incrs` (see {@link incrsLadder}) — with
  *   any product that is not a usable increment (`0`, a negative, or one that overflowed to
  *   `Infinity`) dropped and reported once, the same filter {@link incrsLadder} applies to its own
- *   rungs.
+ *   rungs. A product below 1e-6 is dropped on the same rule and for the sharper reason given
+ *   there: uPlot cannot step by one, and would hang building splits rather than mis-tick. A
+ *   sub-microsecond bucket size therefore keeps only its wider multiples — tick the narrow ones
+ *   through `axis.splits` with {@link splitsForStep}, which has no such limit.
  * @example
  * ```ts
  * import uPlot from 'uplot';

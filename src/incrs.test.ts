@@ -109,7 +109,7 @@ describe('incrsLadder', () => {
 			expect(incrsLadder(10, 0, 1, [Infinity])).toStrictEqual([]);
 			// Every one of the seven names a different bad value, so warn-once dedupes none of them.
 			expect(warn).toHaveBeenCalledTimes(7);
-			expect(warn.mock.calls[0]?.[0]).toContain('incrsLadder: minExp and maxExp must be integers');
+			expect(warn.mock.calls[0]?.[0]).toContain('minExp and maxExp must be safe integers');
 			expect(warn.mock.calls[3]?.[0]).toContain('base must be a finite positive number');
 			expect(warn.mock.calls[5]?.[0]).toContain('mantissas must be finite numbers');
 		} finally {
@@ -152,12 +152,91 @@ describe('incrsLadder', () => {
 		expect(incrsLadder(2, 0, 2, [1, 2])).toStrictEqual([1, 2, 4, 8]);
 	});
 
+	it('refuses an exponent bound too large for the loop to advance past', () => {
+		// Number.isInteger admits 2 ** 53 and everything above it, where `exp++` rounds straight back
+		// to where it started -- so this used to spin pushing NaN rungs until the heap died (measured:
+		// ~3.6s to OOM under --max-old-space-size=256, for a request of five rungs). In a browser that
+		// is a locked UI thread, not a thrown error, which is why the guard is isSafeInteger.
+		const warn = vi.spyOn(console, 'warn').mockImplementation(() => {});
+		try {
+			expect(incrsLadder(10, 2 ** 53, 2 ** 53 + 4, [1])).toStrictEqual([]);
+			expect(incrsLadder(10, 1e21, 1e21, [1])).toStrictEqual([]);
+			expect(warn.mock.calls[0]?.[0]).toContain('must be safe integers');
+		} finally {
+			warn.mockRestore();
+		}
+	});
+
+	it('refuses an exponent span no one can wait out, even though it would terminate', () => {
+		// A base near 1 makes each exponent a hair wide, so an ordinary magnitude range spans tens of
+		// thousands of them -- and the rungs would be near-identical, which findIncr walks linearly.
+		const warn = vi.spyOn(console, 'warn').mockImplementation(() => {});
+		try {
+			expect(incrsLadder(1.0001, 0, 20_000, [1])).toStrictEqual([]);
+			expect(warn.mock.calls[0]?.[0]).toContain('span more than 10000 exponents');
+			// A span just inside the cap is still swept, and the exponents that saturate float64 fall
+			// out on the ordinary value filter: 10^0 through 10^308 are the finite ones.
+			expect(incrsLadder(10, 0, 9999, [1])).toHaveLength(309);
+		} finally {
+			warn.mockRestore();
+		}
+	});
+
 	it('drops a negative mantissa rather than shipping a backwards increment', () => {
 		// The argument guard only asks for finiteness, so a negative mantissa reaches the loop --
 		// and findIncr divides by the increment, so its rungs would space the axis backwards.
 		expect(incrsLadder(10, 0, 1, [-2, 1])).toStrictEqual([1, 10]);
 	});
 });
+
+// uPlot's own arithmetic for turning an increment into tick positions, transcribed from
+// node_modules/uplot/dist/uPlot.esm.js (MIT (c) Leon Sorokin) so the invariant below can be
+// asserted in node. None of it is exported, so there is nothing to call instead.
+function uplotRoundDec(value: number, decimals: number): number {
+	if (Number.isInteger(value)) {
+		return value;
+	}
+	const factor = 10 ** decimals;
+	return Math.round(value * factor * (1 + Number.EPSILON)) / factor;
+}
+
+// uPlot.esm.js:546. Note what it does NOT do: fold in an exponent. '3e-7' has no '.', so 0.
+function uplotGuessDec(value: number): number {
+	return (String(value).split('.')[1] ?? '').length;
+}
+
+// The fixedDec map as uPlot has it after module load (uPlot.esm.js:988, 991, 1187) -- the decimal
+// counts it knows without having to guess. genIncrs is transcribed from uPlot.esm.js:550.
+function uplotFixedDec(): Map<number, number> {
+	const map = new Map<number, number>();
+	const genIncrs = (base: number, minExp: number, maxExp: number, mults: number[]): void => {
+		const multDec = mults.map(uplotGuessDec);
+		for (let exp = minExp; exp < maxExp; exp++) {
+			const expa = Math.abs(exp);
+			const mag = uplotRoundDec(base ** exp, expa);
+			for (const [i, mult] of mults.entries()) {
+				const dec = (exp >= 0 ? 0 : expa) + (exp >= (multDec[i] ?? 0) ? 0 : (multDec[i] ?? 0));
+				const raw = base === 10 ? Number(`${mult}e${exp}`) : mult * mag;
+				map.set(base === 10 ? raw : uplotRoundDec(raw, dec), dec);
+			}
+		}
+	};
+	genIncrs(10, -32, 0, [1, 2, 2.5, 5]);
+	genIncrs(10, 0, 32, [1, 2, 2.5, 5]);
+	genIncrs(2, -53, 53, [1]);
+	return map;
+}
+
+const UPLOT_FIXED_DEC = uplotFixedDec();
+
+// Whether numAxisSplits (uPlot.esm.js:1488) can advance its loop variable by this increment. It
+// steps with `val = roundDec(val + foundIncr, numDec)`, where numDec is the map above for a rung
+// uPlot pre-registered and guessDec(incr) for anything else (uPlot.esm.js:3748) -- so when that
+// guess is 0 for a value smaller than 1, the step is a no-op and the for-loop never terminates.
+function uplotCanStepBy(incr: number): boolean {
+	const numDec = UPLOT_FIXED_DEC.get(incr) ?? uplotGuessDec(incr);
+	return uplotRoundDec(incr, numDec) === incr;
+}
 
 const FACADES: Record<IncrsByUnitKind, () => number[]> = {
 	byte: incrsForBytes,
@@ -183,6 +262,66 @@ function expectSortedAndUnique(values: number[]): void {
 		return current;
 	});
 }
+
+describe('every emitted increment is one uPlot can actually step by', () => {
+	// The sharp end of the module. uPlot reads the decimal count of an increment below 1e-6 off its
+	// String() form, which is exponential there, and gets 0 -- then numAxisSplits' `val = roundDec(
+	// val + incr, 0)` leaves val where it was and the loop pushes forever, locking the browser tab.
+	// Nothing about it is visible as a wrong axis; the page simply stops. So this asserts the model
+	// above, not just the shape of the output.
+	it('holds the model honest: an unregistered sub-1e-6 increment really does hang uPlot', () => {
+		expect(uplotCanStepBy(3e-7)).toBe(false);
+		expect(uplotCanStepBy(1.5e-7)).toBe(false);
+		// The two escapes, both of which the ladders here rely on: a mantissa uPlot pre-registers
+		// per decade, and a power of two from the map it builds for exactly this purpose.
+		expect(uplotCanStepBy(1e-7)).toBe(true);
+		expect(uplotCanStepBy(2 ** -20)).toBe(true);
+		// At and above 1e-6 the string form carries the decimals, so the guess is right.
+		expect(uplotCanStepBy(3e-6)).toBe(true);
+	});
+
+	it.each(ALL_KINDS)('holds for every increment of the %s facade', (kind) => {
+		expect(FACADES[kind]().filter((incr) => !uplotCanStepBy(incr))).toStrictEqual([]);
+	});
+
+	it('holds after the generic entry points drop what they cannot ship', () => {
+		const warn = vi.spyOn(console, 'warn').mockImplementation(() => {});
+		try {
+			expect(incrsStep(3e-7).filter((incr) => !uplotCanStepBy(incr))).toStrictEqual([]);
+			expect(incrsLadder(10, -9, 1, [1, 3]).filter((incr) => !uplotCanStepBy(incr))).toStrictEqual(
+				[]
+			);
+		} finally {
+			warn.mockRestore();
+		}
+	});
+
+	it('keeps the wider multiples of a sub-microsecond step, and names what it dropped', () => {
+		// A step of its own, not 3e-7 above: the warn-once tracker is module-scoped and keyed by
+		// message text, so a test that asserts a message must be the only one to produce it.
+		const warn = vi.spyOn(console, 'warn').mockImplementation(() => {});
+		try {
+			// Only 7e-7 itself is unsteppable; every wider multiple is an ordinary increment.
+			expect(incrsStep(7e-7).slice(0, 3)).toStrictEqual([1.4e-6, 3.5e-6, 7e-6]);
+			expect(warn.mock.calls[0]?.[0]).toContain('1 increment(s) below 0.000001');
+			expect(warn.mock.calls[0]?.[0]).toContain('(7e-7)');
+			expect(warn.mock.calls[0]?.[0]).toContain('splitsForStep');
+		} finally {
+			warn.mockRestore();
+		}
+	});
+
+	it('keeps the pre-registered mantissas of a custom ladder and drops only the rest', () => {
+		const warn = vi.spyOn(console, 'warn').mockImplementation(() => {});
+		try {
+			// 1e-9/1e-8/1e-7 survive (mantissa 1 per decade); 3e-9/3e-8/3e-7 do not; everything from
+			// 1e-6 up is unaffected.
+			expect(incrsLadder(10, -9, -6, [1, 3])).toStrictEqual([1e-9, 1e-8, 1e-7, 1e-6, 3e-6]);
+		} finally {
+			warn.mockRestore();
+		}
+	});
+});
 
 describe('incrsFor* facades', () => {
 	it.each(ALL_KINDS)('returns a sorted, duplicate-free ladder for %s', (kind) => {
