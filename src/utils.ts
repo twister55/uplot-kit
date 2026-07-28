@@ -11,6 +11,24 @@
 // --- Float hygiene ---
 
 /**
+ * The largest decimal-place count worth rounding a double to. Past it {@link roundDec} stops
+ * cleaning and starts dirtying: its `(1 + EPSILON)` nudge is a *relative* one, so once
+ * `|value * 10 ** decimals|` passes 2^51 the nudge exceeds half a unit and the rounding degenerates
+ * into unconditional round-away-from-zero — it moves values that were already exact (2.5 comes back
+ * as 2.5000000000000004) instead of recovering ones that are an ulp off.
+ *
+ * Both units that count decimals are written against this, with different recoveries: splits
+ * switches to significant-digit rounding past it, incrs stops rounding and keeps the raw product,
+ * which above the budget is already the nearest double to the true answer. What neither may do is
+ * act on a {@link fractionDigits} count above it as though it named real decimals.
+ *
+ * The one deliberate exception is the base-2 path in `incrsLadder`, which rounds to |exp| places up
+ * to 53 *because* of the degeneracy: uPlot's own generator does the same and registers the drifted
+ * results in the map it looks tick decimals up in, so matching it matters more than being right.
+ */
+export const MAX_EXACT_DECIMALS = 15;
+
+/**
  * Decimal places in a number's own shortest decimal form. Unlike uPlot's internal `guessDec` this
  * also folds in an exponent, because `String()` switches to exponential notation below 1e-6 and
  * at/above 1e21 (`1e-7` -> 7, `2.5e-7` -> 8) — a range both callers reach, and where undercounting
@@ -18,8 +36,8 @@
  *
  * Above ~16 the answer stops being meaningful (a double has no digits left there, and the shortest
  * round-trip form of the mantissa read on its own is shorter than the digits inside the exponential
- * form), so callers must not act on the exact count in that band: incrs is rounding below the
- * precision a double carries, and splits switches to significant-digit rounding past 15.
+ * form), so callers must not act on the exact count in that band — see {@link MAX_EXACT_DECIMALS},
+ * which both callers bound themselves by.
  *
  * Non-finite input has no decimal form at all and answers 0, which is also what the string path
  * would produce for it ('NaN' and 'Infinity' hold no decimal point) — the guard is the statement,

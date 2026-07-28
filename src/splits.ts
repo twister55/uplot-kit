@@ -8,7 +8,14 @@
 
 import type uPlot from 'uplot';
 
-import { fractionDigits, isPositiveFinite, makeWarnOnce, optionOr, roundDec } from './utils';
+import {
+	fractionDigits,
+	isPositiveFinite,
+	makeWarnOnce,
+	MAX_EXACT_DECIMALS,
+	optionOr,
+	roundDec
+} from './utils';
 
 const SECONDS_PER_DAY = 60 * 60 * 24;
 const SECONDS_PER_WEEK = 7 * SECONDS_PER_DAY;
@@ -111,11 +118,12 @@ function roundSignificant(value: number): number {
 // rounding — the same scale-free rule splitsForLog already uses to clean both magnitude ends with
 // one pass.
 //
-// This threshold is the reason roundDec needs no `digits > 15` guard of its own for this module:
-// it is never called past it from here. incrs does call it past it — a megabyte ladder rounds at 20
-// decimals — which is why the guard belongs here rather than in the shared helper.
+// This threshold is the reason roundDec needs no guard of its own for this module: it is never
+// called past MAX_EXACT_DECIMALS from here. incrs does call it past that — the base-2 ladder rounds
+// at up to 53 decimals, on purpose, to stay bit-identical to uPlot's — which is why the guard
+// belongs at each call site rather than in the shared helper.
 function roundGridValue(value: number, digits: number): number {
-	return digits > 15 ? roundSignificant(value) : roundDec(value, digits);
+	return digits > MAX_EXACT_DECIMALS ? roundSignificant(value) : roundDec(value, digits);
 }
 
 // Folds `-0` onto `+0`. Every tick-producing path that can reach zero from below — stepGrid's grid

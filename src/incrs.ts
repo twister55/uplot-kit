@@ -4,7 +4,14 @@
 // incrsStep, and incrsLadder are exported from the package barrel; the ladders and the option
 // filter below are private to this module.
 
-import { fractionDigits, isPositiveFinite, makeWarnOnce, optionOr, roundDec } from './utils';
+import {
+	fractionDigits,
+	isPositiveFinite,
+	makeWarnOnce,
+	MAX_EXACT_DECIMALS,
+	optionOr,
+	roundDec
+} from './utils';
 
 // One warn-once tracker per entry point, matching the source names splits reports under. These sit
 // at module scope rather than inside a factory because — unlike a splits generator, which closes
@@ -819,6 +826,13 @@ export interface IncrsStepOptions extends IncrsOptions {
  *   there: uPlot cannot step by one, and would hang building splits rather than mis-tick. A
  *   sub-microsecond bucket size therefore keeps only its wider multiples — tick the narrow ones
  *   through `axis.splits` with {@link splitsForStep}, which has no such limit.
+ *
+ *   Products are cleaned of float noise (`25 * 1.1` comes back as `27.5`, not
+ *   `27.500000000000004`) whenever `step` and the mult together name no more decimals than a
+ *   double carries. A `step` that names more — one that is not a short decimal at all, such as
+ *   `(1 - 0.3) / 7` or `1 / 3` — is used raw instead, since there is no decimal to recover and
+ *   rounding at that width would only add noise of its own. Either way the `1` rung is exactly
+ *   `step`.
  * @example
  * ```ts
  * import uPlot from 'uplot';
@@ -855,7 +869,18 @@ export function incrsStep(step: number, options: IncrsStepOptions = {}): number[
 	// and steps splits by it, so a dirty increment prints verbatim through any custom
 	// axis.values (the byte/duration formatters this package exists for). The exact product
 	// has at most (step's decimals + mult's decimals) places, so this only sheds float noise.
-	const scaled = mults.map((mult) => roundDec(mult * step, stepDec + fractionDigits(mult)));
+	//
+	// That premise fails past MAX_EXACT_DECIMALS, and there the rounding stops cleaning and starts
+	// dirtying — see the constant. A step of (1 - 0.3) / 7 claims 17 decimals; rounding its 25x rung
+	// to 17 places turned the exact 2.5 that fell out of the multiplication into 2.5000000000000004,
+	// which is the precise value this line exists to avoid. Above the budget the raw product is
+	// already the nearest double to the true answer, so it is left alone — and the 1x rung then
+	// comes back as `step` itself, which "exact multiples of a fixed step" has to mean.
+	const scaled = mults.map((mult) => {
+		const product = mult * step;
+		const decimals = stepDec + fractionDigits(mult);
+		return decimals > MAX_EXACT_DECIMALS ? product : roundDec(product, decimals);
+	});
 	// The same final filter incrsLadder applies to its own rungs, for the same reason: findIncr
 	// divides by the increment, so a 0 rung can never satisfy its minimum-space test, a non-finite
 	// one poisons the comparison and a negative one spaces backwards. Unlike incrsLadder's, these

@@ -593,6 +593,35 @@ describe('incrsStep', () => {
 		expect(incrsStep(1.1, { mults: [1, 2.5, 25] })).toStrictEqual([1.1, 2.75, 27.5]);
 	});
 
+	describe('a step with more decimals than a double carries', () => {
+		// roundDec's (1 + EPSILON) nudge is relative, so once |value * 10 ** decimals| passes 2^51 it
+		// exceeds half a unit and the rounding degenerates into unconditional round-away-from-zero.
+		// A step that is not a short decimal claims 16-17 places and lands squarely in that band,
+		// where the cleanup dirties exact values instead of recovering approximate ones.
+		it('leaves an already-exact product alone instead of pushing it off', () => {
+			// (1 - 0.3) / 7 is 0.09999999999999999, which fractionDigits reads as 17 places. Its 25x
+			// product is the clean double 2.5 -- rounding to 17 places returned 2.5000000000000004,
+			// the exact class of value this module exists to keep out of a tick label.
+			const values = incrsStep((1.0 - 0.3) / 7, { mults: [1, 2, 5, 10, 25] });
+			expect(values).toContain(2.5);
+			expect(values).not.toContain(2.5000000000000004);
+		});
+
+		it('gives back step itself on the 1x rung', () => {
+			// "Exact multiples of a fixed step" has to mean this one at minimum, and it was the rung
+			// the rounding broke first: incrsStep(1/3)[0] came back as 0.3333333333333334.
+			for (const step of [1 / 3, (1.0 - 0.3) / 7, 0.1 + 0.2, 2 / 7]) {
+				expect(incrsStep(step)).toContain(step);
+			}
+		});
+
+		it('still cleans a step that does name a real decimal', () => {
+			// The guard is on the decimal budget, not on "is this awkward" -- 1.1 and 2.3 claim one
+			// place each and keep the cleanup that makes 25 * 1.1 come back as 27.5.
+			expect(incrsStep(1.1).slice(0, 8)).toStrictEqual([1.1, 2.2, 5.5, 11, 22, 27.5, 55, 110]);
+		});
+	});
+
 	it('handles a step small enough that String() writes it in exponential form', () => {
 		expect(incrsStep(1e-7).slice(0, 5)).toStrictEqual([1e-7, 2e-7, 5e-7, 1e-6, 2e-6]);
 	});
