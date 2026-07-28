@@ -5,6 +5,7 @@
 // filter below are private to this module.
 
 import {
+	describeValue,
 	fractionDigits,
 	isPositiveFinite,
 	makeWarnOnce,
@@ -230,9 +231,17 @@ export function incrsLadder(
 		);
 		return [];
 	}
-	const badMantissa = mantissas.find((mantissa) => !Number.isFinite(mantissa));
-	if (badMantissa !== undefined) {
-		warnLadder(`mantissas must be finite numbers, got ${badMantissa} — no increments`);
+	// findIndex, not find: `find` reports "nothing matched" with the same `undefined` that a bad
+	// mantissa *is*, so an undefined element — or an array hole, which reads as one — matched the
+	// predicate and was then read back as clean. It got no warning and no refusal; downstream the
+	// rung evaluated to NaN and was filtered away, leaving a ladder silently missing a step, which
+	// is exactly the shape this guard exists to refuse. Untyped JS is where both arrive from.
+	const badIndex = mantissas.findIndex((mantissa) => !Number.isFinite(mantissa));
+	if (badIndex !== -1) {
+		warnLadder(
+			`mantissas must be finite numbers, got ${mantissas[badIndex]} at index ${badIndex} — ` +
+				'no increments'
+		);
 		return [];
 	}
 
@@ -783,7 +792,7 @@ export function incrsByUnit(kind: IncrsByUnitKind | number[], options?: IncrsOpt
 	if (!Object.hasOwn(INCRS_FACADES, kind)) {
 		const known = Object.keys(INCRS_FACADES).join(', ');
 		warnByUnit(
-			`unknown unit ${JSON.stringify(kind)} — expected one of ${known}, or an array of ` +
+			`unknown unit ${describeValue(kind)} — expected one of ${known}, or an array of ` +
 				'increments; no increments'
 		);
 		return [];

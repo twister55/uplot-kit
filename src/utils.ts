@@ -150,10 +150,18 @@ export function optionOr<T>(
 	return fallback;
 }
 
-// JSON.stringify renders NaN, Infinity and -Infinity all as `null`, which turns the most common
-// bad-option message into no information at all ("got null — falling back to null"). Numbers are
-// therefore spelled by String(); everything else keeps JSON's quoting, so a bad string option is
-// visibly a string ('Month' rather than Month).
-function describeValue(value: unknown): string {
+/**
+ * How this package spells a bad option value in a warning. `JSON.stringify` renders `NaN`,
+ * `Infinity` and `-Infinity` all as `null`, which turns the most common bad-option message into no
+ * information at all ("got null — falling back to null") and makes the three indistinguishable in
+ * the log — for values that arrive from an unparsed `Number(userInput)` more often than any other.
+ * Numbers are therefore spelled by `String()`; everything else keeps JSON's quoting, so a bad
+ * string option is visibly a string ('Month' rather than Month).
+ *
+ * Exported because {@link optionOr} is not the only place that names a value: an option with no
+ * default warns and returns an inert result instead of falling back, and those call sites have to
+ * spell the value the same way.
+ */
+export function describeValue(value: unknown): string {
 	return typeof value === 'number' ? String(value) : JSON.stringify(value);
 }

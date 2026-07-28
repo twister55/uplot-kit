@@ -1337,6 +1337,31 @@ describe('splitsWithInclude', () => {
 });
 
 describe('splitsWithLimit', () => {
+	it('does what its @example says it does', () => {
+		// The previous example claimed the limit thinned 21 year ticks to every other one, over a
+		// range where the inner generator returned 11 and the decorator was a complete no-op -- and
+		// an example is the first thing copied and the last thing re-read. So the replacement's
+		// arithmetic is pinned here: an hourly grid over a week is 169 ticks, thinned to 12.
+		const HOUR = 60 * 60;
+		const start = Date.UTC(2026, 0, 5) / 1000;
+		const end = start + 168 * HOUR;
+		const inner = splitsForStep({ step: HOUR });
+
+		expect(inner(fakeSelf(), 0, start, end, 0, 0)).toHaveLength(169);
+		expect(splitsWithLimit(inner, 12)(fakeSelf(), 0, start, end, 0, 0)).toHaveLength(12);
+	});
+
+	it('is a no-op over a generator that already thins itself, as the docs warn', () => {
+		// splitsForTime picks a rung from its own ladder to suit the range, so it rarely emits more
+		// than a dozen ticks -- which is why the rotted example above showed no thinning at all.
+		const inner = splitsForTime({ granularity: 'day' });
+		const lo = Date.UTC(2006, 0, 1) / 1000;
+		const hi = Date.UTC(2026, 0, 1) / 1000;
+
+		expect(inner(fakeSelf(), 0, lo, hi, 0, 0)).toHaveLength(11);
+		expect(splitsWithLimit(inner, 12)(fakeSelf(), 0, lo, hi, 0, 0)).toHaveLength(11);
+	});
+
 	it('returns the base ticks unchanged when within the limit', () => {
 		const wrapped = splitsWithLimit(splitsForStep({ step: 10 }), 10);
 

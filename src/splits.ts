@@ -9,6 +9,7 @@
 import type uPlot from 'uplot';
 
 import {
+	describeValue,
 	fractionDigits,
 	isPositiveFinite,
 	makeWarnOnce,
@@ -1190,7 +1191,7 @@ export function splitsForStep(options: SplitsForStepOptions): SplitsFn {
 	// guess. A blank axis with no explanation is the most expensive failure in this file to
 	// track down, and it was the one a plain `step: 0` used to produce.
 	if (!isPositiveFinite(step)) {
-		warn(`step must be a finite number greater than zero, got ${JSON.stringify(step)} — no ticks`);
+		warn(`step must be a finite number greater than zero, got ${describeValue(step)} — no ticks`);
 		return () => [];
 	}
 
@@ -1318,7 +1319,7 @@ export function splitsForCategory(options: SplitsForCategoryOptions = {}): Split
 	let count = rawCount;
 	if (count !== undefined && !(Number.isInteger(count) && count >= 0)) {
 		warn(
-			`count must be a whole number of categories, got ${JSON.stringify(count)} — ` +
+			`count must be a whole number of categories, got ${describeValue(count)} — ` +
 				'ignoring it, so ticks are clamped to the visible range only'
 		);
 		count = undefined;
@@ -1452,23 +1453,31 @@ export function splitsWithInclude(inner: SplitsFn, values: number[]): SplitsFn {
  * guarantee matters more; if both must hold, keep the injected values out of the thinned set by
  * some other means (e.g. a scale range pinned so the edge is a real tick the generator emits).
  *
+ * Pair it with a generator that does *not* thin itself. {@link splitsForTime} already picks a rung
+ * from its own ladder to suit the range, so it rarely emits more than a dozen ticks and this
+ * decorator is usually a no-op on top of it. {@link splitsForStep} and {@link splitsForCategory}
+ * are the ones that emit every grid position regardless of how many that is, and so are the ones
+ * with something to thin.
+ *
  * @example
  * ```ts
  * import uPlot from 'uplot';
- * import { splitsForTime, splitsWithLimit } from 'uplot-kit';
+ * import { splitsForStep, splitsWithLimit } from 'uplot-kit';
  *
- * // two decades of yearly samples: the ladder has already widened to year ticks, and the
- * // limit thins those 21 down to every other one
+ * const HOUR = 60 * 60;
+ * const start = Date.UTC(2026, 0, 5) / 1000;
  * const data: uPlot.AlignedData = [
- *   Array.from({ length: 21 }, (_, i) => Date.UTC(2006 + i, 0, 1) / 1000),
- *   Array.from({ length: 21 }, (_, i) => 100 + ((i * 7) % 23))
+ *   Array.from({ length: 169 }, (_, i) => start + i * HOUR),
+ *   Array.from({ length: 169 }, (_, i) => 100 + ((i * 7) % 23))
  * ];
  *
+ * // an hourly grid over a week is 169 ticks — every one a real bucket boundary, and far too
+ * // many to label. The limit keeps every 15th, so 12 survive; they are still on the hour.
  * const opts: uPlot.Options = {
  *   width: 800,
  *   height: 400,
  *   series: [{}, { label: 'value' }],
- *   axes: [{ splits: splitsWithLimit(splitsForTime({ granularity: 'day' }), 12) }, {}]
+ *   axes: [{ splits: splitsWithLimit(splitsForStep({ step: HOUR }), 12) }, {}]
  * };
  *
  * new uPlot(opts, data, document.body);
@@ -1515,19 +1524,20 @@ export function splitsWithLimit(inner: SplitsFn, maxTicks: number): SplitsFn {
  * splits remain, so their gridlines and tick marks still render), while dropping a tick here
  * removes it entirely — label, gridline, and tick mark.
  *
- * Wrap this *outside* {@link splitsWithEdges}, not inside it —
- * `splitsWithEdges(splitsWithFilter(inner, keep))` re-adds the range edges without passing
- * them through `keep`, so on a window the filter empties (a weekend-only zoom, say) the
- * fallback puts back exactly the ticks the filter removed. Wrapping the other way,
- * `splitsWithFilter(splitsWithEdges(inner), keep)`, filters the edges too.
+ * Wrap this *inside* {@link splitsWithEdges}, not outside it —
+ * `splitsWithEdges(splitsWithFilter(inner, keep))`. That order does mean the fallback re-adds the
+ * range edges without passing them through `keep`, so on a window the filter empties (a weekend-only
+ * zoom, say) the axis shows two edge ticks the predicate would have rejected. That is the lesser
+ * cost: wrapping the other way, `splitsWithFilter(splitsWithEdges(inner), keep)`, filters those
+ * edges out too and leaves the axis blank — the exact failure `splitsWithEdges` exists to prevent.
  *
- * The opposite order is right for {@link splitsWithInclude}: wrap this **inside** it, not outside.
- * `splitsWithFilter(splitsWithInclude(inner, [t]), keep)` runs `keep` over the injected `t` too, so
- * a `t` that fails the predicate is silently dropped every redraw — the guarantee `splitsWithInclude`
- * exists to make, gone. Wrap the other way, `splitsWithInclude(splitsWithFilter(inner, keep), [t])`,
- * and the filter only ever sees the generator's own ticks while `t` is injected afterward, kept
- * unconditionally. In short: a filter belongs between the generator and any decorator that
- * guarantees a tick, never on top of one.
+ * The same order is right for {@link splitsWithInclude}, for the same reason: wrap this **inside**
+ * it. `splitsWithFilter(splitsWithInclude(inner, [t]), keep)` runs `keep` over the injected `t` too,
+ * so a `t` that fails the predicate is silently dropped every redraw — the guarantee
+ * `splitsWithInclude` exists to make, gone. Wrap the other way,
+ * `splitsWithInclude(splitsWithFilter(inner, keep), [t])`, and the filter only ever sees the
+ * generator's own ticks while `t` is injected afterward, kept unconditionally. In short: a filter
+ * belongs between the generator and any decorator that guarantees a tick, never on top of one.
  *
  * @example
  * ```ts

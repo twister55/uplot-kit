@@ -117,6 +117,23 @@ describe('incrsLadder', () => {
 		}
 	});
 
+	it('catches an undefined mantissa and an array hole, which used to slip the guard', () => {
+		// The guard read `find`'s "nothing matched" return -- undefined -- as clean, but undefined is
+		// itself a non-finite mantissa, so it matched the predicate and was then waved through. No
+		// warning, no refusal: downstream the rung came out NaN and was filtered away, leaving a
+		// ladder silently missing a step. Both shapes arrive from plain JS, which is what the guard
+		// is for. NaN and null are the control -- those always did refuse.
+		const warn = vi.spyOn(console, 'warn').mockImplementation(() => {});
+		try {
+			expect(incrsLadder(10, 0, 2, [1, undefined as never, 5])).toStrictEqual([]);
+			expect(incrsLadder(10, 0, 2, new Array<number>(3))).toStrictEqual([]);
+			expect(incrsLadder(10, 0, 2, [1, null as never])).toStrictEqual([]);
+			expect(warn.mock.calls[0]?.[0]).toContain('got undefined at index 1');
+		} finally {
+			warn.mockRestore();
+		}
+	});
+
 	it('warns once per distinct problem, not once per call', () => {
 		// The tracker lives at module scope, not inside a factory the way splits' does: every
 		// function here is called afresh per axis, so a per-call tracker would warn every redraw.
