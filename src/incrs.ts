@@ -4,38 +4,30 @@
 // incrsStep, and incrsLadder are exported from the package barrel; the ladders and the option
 // filter below are private to this module.
 
+import { fractionDigits, isPositiveFinite, makeWarnOnce, optionOr, roundDec } from './utils';
+
+// One warn-once tracker per entry point, matching the source names splits reports under. These sit
+// at module scope rather than inside a factory because — unlike a splits generator, which closes
+// over its options once — every function here is called afresh per axis, so a per-call tracker
+// would warn on every redraw. The trade is that two charts making the same mistake are told once
+// between them, which is the right economy for a console message naming a config error.
+//
+// The `/* @__PURE__ */` annotations are the same load-bearing kind as the ladders below: a bare
+// top-level call is a side effect a bundler must keep, which would pin this module (and with it
+// every ladder) into a bundle that imports nothing from it.
+const warnLadder = /* @__PURE__ */ makeWarnOnce('incrsLadder');
+const warnByUnit = /* @__PURE__ */ makeWarnOnce('incrsByUnit');
+const warnStep = /* @__PURE__ */ makeWarnOnce('incrsStep');
+// The min/maxIncr filter is shared by all eleven entry points, so its warnings are sourced to the
+// module rather than to whichever facade happened to be called.
+const warnOptions = /* @__PURE__ */ makeWarnOnce('incrs');
+
 // --- Engine: incrsLadder ---
 
-// Float-hygiene mirrors uPlot's own internal `genIncrs`/`roundDec` (MIT © Leon Sorokin,
-// node_modules/uplot/dist/uPlot.esm.js, around line 550) — it isn't exported, so this is a
-// reimplementation of the algorithm, not a wrapper around it. Without this rounding, ladders
-// collect values like 2.5000000000000004e-7, and uPlot derives a tick label's decimal-place
-// count from the increment itself — a dirty increment produces a dirty label.
-
-// Decimal-place count from a number's string form. Unlike uPlot's own guessDec this also folds in
-// an exponent, because String() switches to exponential notation below 1e-6 and at/above 1e21
-// (1e-7 -> 7, 2.5e-7 -> 8) — values a caller can hand to incrsLadder's mantissas or incrsStep's
-// step, where undercounting to 0 would round the increment away to nothing.
-function guessDec(num: number): number {
-	const [mantissa = '', exp] = String(num).split('e');
-	const fractionLen = (mantissa.split('.')[1] ?? '').length;
-	return Math.max(0, fractionLen - (exp === undefined ? 0 : Number(exp)));
-}
-
-// Half-away-from-zero rounding; the (1 + EPSILON) factor nudges a binary approximation that's
-// "really" a round decimal (2.4999999999999996 for 2.5) back onto it.
-function roundDec(val: number, dec: number): number {
-	if (Number.isInteger(val)) {
-		return val;
-	}
-	const p = 10 ** dec;
-	// Past dec 308 the scale factor itself overflows, and val * Infinity / Infinity is NaN — a
-	// magnitude too small to round is returned as-is rather than destroyed.
-	if (!Number.isFinite(p)) {
-		return val;
-	}
-	return Math.round(val * p * (1 + Number.EPSILON)) / p;
-}
+// Float hygiene comes from the shared `roundDec`/`fractionDigits` in ./utils, which mirror uPlot's
+// own internal `genIncrs`/`roundDec`. Without that rounding, ladders collect values like
+// 2.5000000000000004e-7, and uPlot derives a tick label's decimal-place count from the increment
+// itself — a dirty increment produces a dirty label.
 
 // Decimal places one negative power of `base` needs to stay exact, or null when `base` has a prime
 // factor other than 2 or 5 (3, 7, 60, ...) and its negative powers have no finite decimal form at
@@ -93,8 +85,12 @@ function decsPerNegExp(base: number): number | null {
  *   comes back as `2.384185791015627e-7`). The drift is deliberately preserved rather than fixed:
  *   uPlot pre-registers `genIncrs(2, -53, 53, [1])` in the internal `fixedDec` map it looks tick
  *   decimals up in, so a "more correct" value here would simply miss that map.
- * @throws {RangeError} If `base`, `minExp`, `maxExp` or any mantissa is outside the ranges above.
- *   Unvalidated, `maxExp: Infinity` spins forever and a `NaN` argument silently poisons every rung.
+ *   An argument outside the ranges above warns once on the console and yields an empty ladder,
+ *   rather than throwing: unvalidated, `maxExp: Infinity` spins forever and a `NaN` argument
+ *   silently poisons every rung, but neither has an honest substitute to fall back to, and a
+ *   config-driven mistake should not take the whole chart down with it. Note that an empty
+ *   `axis.incrs` leaves uPlot's `findIncr` with no increment to pick, so that axis renders no
+ *   ticks — the console warning is what points at the cause.
  * @example
  * ```ts
  * import { incrsLadder } from 'uplot-kit';
@@ -109,21 +105,26 @@ export function incrsLadder(
 	maxExp: number,
 	mantissas: number[]
 ): number[] {
-	if (!Number.isFinite(base) || base <= 0) {
-		throw new RangeError(`incrsLadder: base must be a finite positive number, got ${base}`);
+	// None of these has a documented default to fall back to — a ladder with no base is not a
+	// ladder — so this is the other half of the package's option policy (see optionOr in ./utils):
+	// name the bad argument, say it once, and produce the inert result rather than guess. Nothing
+	// here throws, so one bad value in a chart config costs an axis its ticks, not the page.
+	if (!isPositiveFinite(base)) {
+		warnLadder(`base must be a finite positive number, got ${base} — no increments`);
+		return [];
 	}
 	if (!Number.isInteger(minExp) || !Number.isInteger(maxExp)) {
-		throw new RangeError(
-			`incrsLadder: minExp and maxExp must be integers, got ${minExp} and ${maxExp}`
-		);
+		warnLadder(`minExp and maxExp must be integers, got ${minExp} and ${maxExp} — no increments`);
+		return [];
 	}
 	const badMantissa = mantissas.find((mantissa) => !Number.isFinite(mantissa));
 	if (badMantissa !== undefined) {
-		throw new RangeError(`incrsLadder: mantissas must be finite numbers, got ${badMantissa}`);
+		warnLadder(`mantissas must be finite numbers, got ${badMantissa} — no increments`);
+		return [];
 	}
 
 	const incrs: number[] = [];
-	const mantissaDecs = mantissas.map(guessDec);
+	const mantissaDecs = mantissas.map(fractionDigits);
 	// String() switches to exponential notation outside [1e-6, 1e21), which the base-10
 	// string-concatenation path below cannot splice a second exponent into ('1e-7' + 'e-3').
 	const isPlainNotation = mantissas.map((mantissa) => !String(mantissa).includes('e'));
@@ -326,9 +327,14 @@ export interface IncrsOptions {
 // merely be ignored — it would empty the ladder, and an empty axis.incrs makes uPlot's findIncr
 // return no increment at all and the axis render no ticks whatsoever. A bound that isn't a number
 // therefore reverts to the documented default. `?? ` (not `||`) keeps a deliberate 0 bound.
-function incrsBound(value: number | undefined, fallback: number): number {
+//
+// Routed through the shared optionOr so the fallback is *announced*: this used to be a silent
+// swallow, which is the one shape the rest of the package is written against — a
+// `Number(userInput)` that didn't parse produced a full, plausible ladder with the caller's bound
+// quietly ignored, and nothing said so.
+function incrsBound(name: string, value: number | undefined, fallback: number): number {
 	const bound = value ?? fallback;
-	return Number.isNaN(bound) ? fallback : bound;
+	return optionOr(warnOptions, name, bound, !Number.isNaN(bound), 'a number', fallback);
 }
 
 // Always allocates a new array via filter — even when both bounds are left at their defaults —
@@ -337,8 +343,8 @@ function incrsBound(value: number | undefined, fallback: number): number {
 // chart's ticks. Private to this module — both the incrsFor* facades and incrsStep run their
 // ladders through it.
 function applyIncrsOptions(ladder: readonly number[], options: IncrsOptions | undefined): number[] {
-	const minIncr = incrsBound(options?.minIncr, -Infinity);
-	const maxIncr = incrsBound(options?.maxIncr, Infinity);
+	const minIncr = incrsBound('minIncr', options?.minIncr, -Infinity);
+	const maxIncr = incrsBound('maxIncr', options?.maxIncr, Infinity);
 	return ladder.filter((incr) => incr >= minIncr && incr <= maxIncr);
 }
 
@@ -562,7 +568,11 @@ const INCRS_FACADES: Record<IncrsByUnitKind, (options?: IncrsOptions) => number[
  *   `'bit'`, `'integer'`, `'second'`, `'millisecond'`, `'microsecond'`, `'nanosecond'`), or a
  *   custom ascending, duplicate-free array of increments.
  * @param options Applied to both built-in and custom ladders alike.
- * @throws {TypeError} If `kind` is a string that names no built-in family.
+ * @returns The named family's ladder, or an empty array for a `kind` that names no built-in
+ *   family — warned about once on the console rather than thrown, since this is precisely the
+ *   entry point whose argument arrives unvalidated from a chart config, and a typo there should
+ *   not take the page down. An empty `axis.incrs` leaves that axis with no ticks, so the warning
+ *   is what points at the typo.
  * @example
  * ```ts
  * import uPlot from 'uplot';
@@ -587,9 +597,11 @@ export function incrsByUnit(kind: IncrsByUnitKind | number[], options?: IncrsOpt
 	// itself (typed as number[]), from which a single delete breaks every chart in the process.
 	if (!Object.hasOwn(INCRS_FACADES, kind)) {
 		const known = Object.keys(INCRS_FACADES).join(', ');
-		throw new TypeError(
-			`incrsByUnit: unknown unit ${JSON.stringify(kind)} — expected one of ${known}, or an array of increments.`
+		warnByUnit(
+			`unknown unit ${JSON.stringify(kind)} — expected one of ${known}, or an array of ` +
+				'increments; no increments'
 		);
+		return [];
 	}
 	return INCRS_FACADES[kind](options);
 }
@@ -615,7 +627,13 @@ export interface IncrsStepOptions extends IncrsOptions {
  * never finer than `step`.
  *
  * @param step The fixed step every increment is a multiple of, e.g. `900` for 15-minute
- *   buckets expressed in seconds.
+ *   buckets expressed in seconds. Required and has no default — a bucket ladder with no bucket
+ *   size is not a ladder — so a value that is not finite and above zero warns once and yields no
+ *   increments, the same answer `splitsForStep` gives an unusable `step`.
+ * @returns The `mults` scaled by `step`, in the order given, with any product that is not a usable
+ *   increment (`0`, or one that overflowed to `Infinity`) dropped and reported once — the same
+ *   filter {@link incrsLadder} applies to its own rungs, since uPlot's `findIncr` divides by the
+ *   increment.
  * @example
  * ```ts
  * import uPlot from 'uplot';
@@ -637,15 +655,32 @@ export interface IncrsStepOptions extends IncrsOptions {
  * ```
  */
 export function incrsStep(step: number, options: IncrsStepOptions = {}): number[] {
+	// The one argument here with no default to fall back to, handled exactly as splitsForStep
+	// handles its own `step`: an unusable spacing produces nothing, said once, rather than a
+	// ladder of zeroes or NaNs that reaches uPlot looking like a real one.
+	if (!isPositiveFinite(step)) {
+		warnStep(`step must be a finite number greater than zero, got ${step} — no increments`);
+		return [];
+	}
+
 	const { mults = INTEGER_INCRS, ...incrsOptions } = options;
-	const stepDec = guessDec(step);
-	return applyIncrsOptions(
-		// Rounded like every other ladder in this module, not the raw product: 25 * 1.1 is
-		// 27.500000000000004, and uPlot both derives a label's decimal count from the increment
-		// and steps splits by it, so a dirty increment prints verbatim through any custom
-		// axis.values (the byte/duration formatters this package exists for). The exact product
-		// has at most (step's decimals + mult's decimals) places, so this only sheds float noise.
-		mults.map((mult) => roundDec(mult * step, stepDec + guessDec(mult))),
-		incrsOptions
-	);
+	const stepDec = fractionDigits(step);
+	// Rounded like every other ladder in this module, not the raw product: 25 * 1.1 is
+	// 27.500000000000004, and uPlot both derives a label's decimal count from the increment
+	// and steps splits by it, so a dirty increment prints verbatim through any custom
+	// axis.values (the byte/duration formatters this package exists for). The exact product
+	// has at most (step's decimals + mult's decimals) places, so this only sheds float noise.
+	const scaled = mults.map((mult) => roundDec(mult * step, stepDec + fractionDigits(mult)));
+	// The same final filter incrsLadder applies to its own rungs, for the same reason: findIncr
+	// divides by the increment, so a 0 rung can never satisfy its minimum-space test and a
+	// non-finite one poisons the comparison. Unlike incrsLadder's, these come straight from a
+	// caller's `mults` rather than from an exponent that saturated, so the drop is reported.
+	const usable = scaled.filter((incr) => Number.isFinite(incr) && incr !== 0);
+	if (usable.length < scaled.length) {
+		warnStep(
+			`dropped ${scaled.length - usable.length} of ${scaled.length} mults whose product with ` +
+				'step is zero or not finite — those are not usable as increments'
+		);
+	}
+	return applyIncrsOptions(usable, incrsOptions);
 }

@@ -1,4 +1,4 @@
-import { describe, expect, it } from 'vitest';
+import { describe, expect, it, vi } from 'vitest';
 
 import {
 	incrsByUnit,
@@ -94,16 +94,40 @@ describe('incrsLadder', () => {
 		expect(incrsLadder(10, -400, -400, [1])).toStrictEqual([]);
 	});
 
-	it('rejects arguments that would hang or poison the ladder', () => {
-		// maxExp: Infinity is the sharp one -- the loop bound is inclusive (a deliberate
-		// divergence from uPlot), so it never terminates rather than returning empty.
-		expect(() => incrsLadder(10, 0, Infinity, [1])).toThrow(RangeError);
-		expect(() => incrsLadder(10, -0.5, 0.5, [1])).toThrow(RangeError);
-		expect(() => incrsLadder(10, NaN, 1, [1])).toThrow(RangeError);
-		expect(() => incrsLadder(0, 0, 1, [1])).toThrow(RangeError);
-		expect(() => incrsLadder(Infinity, 0, 1, [1])).toThrow(RangeError);
-		expect(() => incrsLadder(10, 0, 1, [1, NaN])).toThrow(RangeError);
-		expect(() => incrsLadder(10, 0, 1, [Infinity])).toThrow(RangeError);
+	it('warns and yields nothing for arguments that would hang or poison the ladder', () => {
+		const warn = vi.spyOn(console, 'warn').mockImplementation(() => {});
+		try {
+			// maxExp: Infinity is the sharp one -- the loop bound is inclusive (a deliberate
+			// divergence from uPlot), so it never terminates rather than returning empty.
+			expect(incrsLadder(10, 0, Infinity, [1])).toStrictEqual([]);
+			expect(incrsLadder(10, -0.5, 0.5, [1])).toStrictEqual([]);
+			expect(incrsLadder(10, NaN, 1, [1])).toStrictEqual([]);
+			expect(incrsLadder(0, 0, 1, [1])).toStrictEqual([]);
+			expect(incrsLadder(Infinity, 0, 1, [1])).toStrictEqual([]);
+			expect(incrsLadder(10, 0, 1, [1, NaN])).toStrictEqual([]);
+			expect(incrsLadder(10, 0, 1, [Infinity])).toStrictEqual([]);
+			// Every one of the seven names a different bad value, so warn-once dedupes none of them.
+			expect(warn).toHaveBeenCalledTimes(7);
+			expect(warn.mock.calls[0]?.[0]).toContain('incrsLadder: minExp and maxExp must be integers');
+			expect(warn.mock.calls[3]?.[0]).toContain('base must be a finite positive number');
+			expect(warn.mock.calls[5]?.[0]).toContain('mantissas must be finite numbers');
+		} finally {
+			warn.mockRestore();
+		}
+	});
+
+	it('warns once per distinct problem, not once per call', () => {
+		// The tracker lives at module scope, not inside a factory the way splits' does: every
+		// function here is called afresh per axis, so a per-call tracker would warn every redraw.
+		const warn = vi.spyOn(console, 'warn').mockImplementation(() => {});
+		try {
+			expect(incrsLadder(-1, 0, 1, [1])).toStrictEqual([]);
+			expect(incrsLadder(-1, 0, 1, [1])).toStrictEqual([]);
+			expect(incrsLadder(-1, 0, 1, [1])).toStrictEqual([]);
+			expect(warn).toHaveBeenCalledOnce();
+		} finally {
+			warn.mockRestore();
+		}
 	});
 
 	it('orders results by exponent then by mantissa order, ascending for positive mantissas', () => {
@@ -258,14 +282,24 @@ describe('incrsFor* facades', () => {
 			expect(incrsForSeconds({ minIncr: 1, maxIncr: 0 })).toStrictEqual([]);
 		});
 
-		it('ignores a NaN bound instead of emptying the ladder', () => {
+		it('warns about a NaN bound and ignores it instead of emptying the ladder', () => {
 			// `incr >= NaN` is false for every rung, so an unparsed Number(userInput) used to drop
 			// every increment -- and an empty axis.incrs makes uPlot render no ticks at all, which
-			// looks identical to the deliberate empty case above.
-			const all = incrsForSeconds().length;
-			expect(incrsForSeconds({ minIncr: NaN })).toHaveLength(all);
-			expect(incrsForSeconds({ maxIncr: NaN })).toHaveLength(all);
-			expect(incrsForSeconds({ minIncr: Number('1h') })).toHaveLength(all);
+			// looks identical to the deliberate empty case above. The fallback is announced rather
+			// than silent: the caller's bound is being ignored, and nothing else would say so.
+			const warn = vi.spyOn(console, 'warn').mockImplementation(() => {});
+			try {
+				const all = incrsForSeconds().length;
+				expect(incrsForSeconds({ minIncr: NaN })).toHaveLength(all);
+				expect(incrsForSeconds({ maxIncr: NaN })).toHaveLength(all);
+				expect(incrsForSeconds({ minIncr: Number('1h') })).toHaveLength(all);
+				// Two distinct messages (minIncr, maxIncr); the third call repeats the first.
+				expect(warn).toHaveBeenCalledTimes(2);
+				expect(warn.mock.calls[0]?.[0]).toContain('minIncr must be a number, got NaN');
+				expect(warn.mock.calls[1]?.[0]).toContain('maxIncr must be a number, got NaN');
+			} finally {
+				warn.mockRestore();
+			}
 		});
 
 		it('still honours a deliberate 0 bound', () => {
@@ -294,24 +328,31 @@ describe('incrsByUnit', () => {
 	// This is the module's runtime-dispatch entry point, so its argument is exactly the one that
 	// can arrive unvalidated from a chart config -- and TypeScript can't help there.
 	it.each(['gigabyte', 'valueOf', 'toString', 'constructor', '__proto__'])(
-		'throws a named TypeError for the unrecognised kind %s',
+		'warns and yields no increments for the unrecognised kind %s',
 		(kind) => {
-			expect(() => incrsByUnit(kind as IncrsByUnitKind)).toThrow(TypeError);
-			expect(() => incrsByUnit(kind as IncrsByUnitKind)).toThrow(/unknown unit/);
+			// Not a throw: this is the entry point whose argument arrives from a chart config, so a
+			// typo there costs an axis its ticks and prints a name, rather than taking the page down.
+			const warn = vi.spyOn(console, 'warn').mockImplementation(() => {});
+			try {
+				expect(incrsByUnit(kind as IncrsByUnitKind)).toStrictEqual([]);
+				expect(warn).toHaveBeenCalledOnce();
+				expect(warn.mock.calls[0]?.[0]).toContain('unknown unit');
+			} finally {
+				warn.mockRestore();
+			}
 		}
 	);
 
 	it('never leaks the shared facade map through an inherited key', () => {
 		// A bare lookup resolved Object.prototype.valueOf and invoked it, returning the private
 		// facade singleton typed as number[] -- one delete on it would have broken every chart in
-		// the process.
-		let leaked: unknown;
+		// the process. The own-property check turns it into the same refusal any unknown unit gets.
+		const warn = vi.spyOn(console, 'warn').mockImplementation(() => {});
 		try {
-			leaked = incrsByUnit('valueOf' as IncrsByUnitKind);
-		} catch {
-			leaked = undefined;
+			expect(incrsByUnit('valueOf' as IncrsByUnitKind)).toStrictEqual([]);
+		} finally {
+			warn.mockRestore();
 		}
-		expect(leaked).toBeUndefined();
 	});
 });
 
@@ -367,5 +408,34 @@ describe('incrsStep', () => {
 
 	it('returns a fresh array on every call', () => {
 		expect(incrsStep(900)).not.toBe(incrsStep(900));
+	});
+
+	it('warns and yields nothing for a step that is not finite and positive', () => {
+		// The same answer splitsForStep gives its own unusable step: `step` has no default to fall
+		// back to, and a ladder of zeroes or NaNs reaches uPlot looking like a real one.
+		const warn = vi.spyOn(console, 'warn').mockImplementation(() => {});
+		try {
+			expect(incrsStep(0)).toStrictEqual([]);
+			expect(incrsStep(-900)).toStrictEqual([]);
+			expect(incrsStep(NaN)).toStrictEqual([]);
+			expect(incrsStep(Infinity)).toStrictEqual([]);
+			expect(warn).toHaveBeenCalledTimes(4);
+			expect(warn.mock.calls[0]?.[0]).toContain('step must be a finite number greater than zero');
+		} finally {
+			warn.mockRestore();
+		}
+	});
+
+	it('drops mults whose product with step is not a usable increment, and says so', () => {
+		// findIncr divides by the increment, so a 0 rung is dead weight and a non-finite one poisons
+		// the comparison -- the same filter incrsLadder applies to its own rungs.
+		const warn = vi.spyOn(console, 'warn').mockImplementation(() => {});
+		try {
+			expect(incrsStep(900, { mults: [0, 1, NaN, 2, 1e308] })).toStrictEqual([900, 1800]);
+			expect(warn).toHaveBeenCalledOnce();
+			expect(warn.mock.calls[0]?.[0]).toContain('dropped 3 of 5 mults');
+		} finally {
+			warn.mockRestore();
+		}
 	});
 });

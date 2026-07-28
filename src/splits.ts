@@ -8,6 +8,8 @@
 
 import type uPlot from 'uplot';
 
+import { fractionDigits, isPositiveFinite, makeWarnOnce, optionOr, roundDec } from './utils';
+
 const SECONDS_PER_DAY = 60 * 60 * 24;
 const SECONDS_PER_WEEK = 7 * SECONDS_PER_DAY;
 const APPROXIMATE_YEAR = 366 * SECONDS_PER_DAY;
@@ -55,56 +57,6 @@ function isTickable(scaleMin: number, scaleMax: number): boolean {
 	return Number.isFinite(scaleMin) && Number.isFinite(scaleMax) && scaleMin <= scaleMax;
 }
 
-// The rule two generators independently apply to a length-like option: splitsForTime's `ms` (axis
-// units per millisecond) and splitsForStep's `step` (grid spacing) both mean "nothing sensible to
-// scale/space by" unless finite and above zero. Only the predicate is shared — the recovery differs
-// on purpose (ms falls back to its default, step has none and ticks nothing), which is why this is a
-// bare boolean the callers branch on rather than a warn-and-fallback helper.
-function isPositiveFinite(value: number): boolean {
-	return Number.isFinite(value) && value > 0;
-}
-
-// One warn-once tracker per generator instance, so a chart that redraws every frame on a
-// degenerate range logs once, not per frame. Keyed by the message rather than by a single flag:
-// a generator can report structurally unrelated conditions (an unplaceable grid, a capped walk)
-// that are fixed by different things, so silencing one must not silence the others.
-function makeWarnOnce(source: string): (detail: string) => void {
-	const warned = new Set<string>();
-	return (detail) => {
-		if (!warned.has(detail)) {
-			warned.add(detail);
-			console.warn(`uplot-kit ${source}: ${detail}`);
-		}
-	};
-}
-
-// Factory-time option check, shared by every generator. The types below are narrow, but a value
-// they forbid still arrives from plain JavaScript or from a config object cast into shape — and
-// the expensive part is never the bad value itself, it is that guessing silently for it yields a
-// plausible-looking axis nobody thinks to distrust (`base: 0` ticking a lone 1, a fractional
-// `weekStartsOn` putting every week tick at midday). Each is named, reported once, and replaced
-// by the documented default, so the chart still renders and the console says why.
-//
-// Checked here rather than per redraw because none of these can change afterwards: the option is
-// closed over, so a per-call test re-answers a settled question on every frame.
-function optionOr<T>(
-	warn: (detail: string) => void,
-	name: string,
-	value: T,
-	isValid: boolean,
-	requirement: string,
-	fallback: T
-): T {
-	if (isValid) {
-		return value;
-	}
-	warn(
-		`${name} must be ${requirement}, got ${JSON.stringify(value)} — ` +
-			`falling back to ${JSON.stringify(fallback)}`
-	);
-	return fallback;
-}
-
 const CAP_REACHED =
 	`stopped after ${MAX_TICK_CANDIDATES} tick candidates — ` + 'the scale range looks degenerate';
 
@@ -133,43 +85,6 @@ function makeCollector(warn: (detail: string) => void): TickCollector {
 	return { values, push, warn };
 }
 
-// Number of digits after the decimal point in `value`'s own shortest decimal form, used to
-// round a computed tick back to exactly the precision its inputs carry. Exponential notation
-// (`1e-7`, whose string form has no decimal point at all) is handled by folding the exponent
-// into the mantissa's own digit count.
-function fractionDigits(value: number): number {
-	if (!Number.isFinite(value)) {
-		return 0;
-	}
-	const text = Math.abs(value).toString();
-	const exponentAt = text.indexOf('e');
-	if (exponentAt >= 0) {
-		const exponent = Number(text.slice(exponentAt + 1));
-		return Math.max(0, fractionDigits(Number(text.slice(0, exponentAt))) - exponent);
-	}
-	const dotAt = text.indexOf('.');
-	return dotAt < 0 ? 0 : text.length - dotAt - 1;
-}
-
-// Rounds a grid value to `digits` decimals, undoing the representation error that even exact
-// index math carries for fractional steps (`3 * 0.1 === 0.30000000000000004`). Past 15 digits a
-// double has no precision left to round to, so the value passes through untouched rather than
-// overflowing the 10**digits factor.
-// Every factor roundTo can ask for, resolved once. It runs per tick — a 200-tick axis was paying
-// 200 `10 ** digits` per redraw for a value that only ever takes these 16 forms — and each is
-// exact, since 1e15 is still under 2**53.
-const POW10 = Array.from({ length: 16 }, (_, exponent) => 10 ** exponent);
-
-function roundTo(value: number, digits: number): number {
-	if (digits <= 0 || digits > 15 || !Number.isFinite(value)) {
-		return value;
-	}
-	// `digits` is a whole number in 1..15 here, so the fallback is unreachable — it is how the
-	// lookup is spelled without a non-null assertion under noUncheckedIndexedAccess.
-	const factor = POW10[digits] ?? 10 ** digits;
-	return Math.round(value * factor) / factor;
-}
-
 // A double carries just under 16 significant decimal digits, so re-reading a value at 15 drops
 // the last digit — which is exactly where a product's representation error lives — and leaves
 // every value that was exact at that width untouched.
@@ -185,18 +100,22 @@ function roundSignificant(value: number): number {
 	return Number.isFinite(value) ? Number(value.toPrecision(SIGNIFICANT_DIGITS)) : value;
 }
 
-// The rounding stepGrid applies to a raw grid value. Decimal-place rounding (roundTo) is the right
-// tool for an ordinary fractional step — it is exact and recovers the decimal the caller wrote
-// (`3 * 0.1` back to `0.3`) — but it gives up once `digits` exceeds 15, and a step or anchor whose
-// own shortest decimal is longer than that reaches exactly there: `1/3` is "0.3333333333333333"
-// (16 digits), `0.1 + 0.2` is "0.30000000000000004" (17), and any step at a magnitude below ~1e-15
-// needs more decimals than a double carries. Left to roundTo alone the whole grid then came out in
-// float noise (a clean `0.1` step under a noisy anchor emitting `0.6000000000000001`). Past that
-// threshold this falls back to significant-digit rounding — the same scale-free rule splitsForLog
-// already uses to clean both magnitude ends with one pass. Below the threshold roundTo is unchanged,
-// so no ordinary grid rounds differently.
+// The rounding stepGrid applies to a raw grid value. Decimal-place rounding (the shared roundDec)
+// is the right tool for an ordinary fractional step — it is exact and recovers the decimal the
+// caller wrote (`3 * 0.1` back to `0.3`) — but it has nothing left to work with once `digits`
+// exceeds 15, and a step or anchor whose own shortest decimal is longer than that reaches exactly
+// there: `1/3` is "0.3333333333333333" (16 digits), `0.1 + 0.2` is "0.30000000000000004" (17), and
+// any step at a magnitude below ~1e-15 needs more decimals than a double carries. Left to decimal
+// rounding alone the whole grid then came out in float noise (a clean `0.1` step under a noisy
+// anchor emitting `0.6000000000000001`). Past that threshold this falls back to significant-digit
+// rounding — the same scale-free rule splitsForLog already uses to clean both magnitude ends with
+// one pass.
+//
+// This threshold is the reason roundDec needs no `digits > 15` guard of its own for this module:
+// it is never called past it from here. incrs does call it past it — a megabyte ladder rounds at 20
+// decimals — which is why the guard belongs here rather than in the shared helper.
 function roundGridValue(value: number, digits: number): number {
-	return digits > 15 ? roundSignificant(value) : roundTo(value, digits);
+	return digits > 15 ? roundSignificant(value) : roundDec(value, digits);
 }
 
 // Folds `-0` onto `+0`. Every tick-producing path that can reach zero from below — stepGrid's grid
@@ -720,9 +639,26 @@ const DEFAULT_MS = 1e-3;
 // Decimal decades, matching uPlot's own default `log`.
 const DEFAULT_BASE = 10;
 
+// Both ladder constants below are built by a wrapper function called once behind a
+// `/* @__PURE__ */` annotation, rather than written as bare top-level literals. That shape is
+// load-bearing, not decorative: an object or array literal that *spreads another identifier*
+// (`{ unit: 'day', ..., ...everyNDays(1) }`) is not pruned even when annotated — evaluating a
+// spread isn't treated as inherently pure, unlike a spread-free literal — so as bare literals
+// these pinned themselves, and transitively every calendar walker, startOfDay/startOfWeek/
+// startOfMonth/startOfYear, utcMonthStart and the scratch Date, into *every* consumer bundle,
+// including one that imports nothing from this file. Measured with the two-pass check
+// (`pnpm build`, then esbuild --bundle --tree-shaking=true over a consumer importing only
+// `stackedBands`): 4959 bytes before, 1712 after. A single wrapped call is the one pattern that
+// sidesteps it — the same finding, with the same empirical backing, is written up at the ladders
+// in src/incrs.ts. Keep this shape when adding rungs.
+
 // The coarsest rung, hoisted so the range lookup below has a total fallback the compiler can see
 // is defined — its Infinity limit means the lookup never actually misses.
-const COARSEST_RUNG: SplitLevel = { unit: 'year', rangeLimit: Infinity, ...everyNYears(100) };
+function buildCoarsestRung(): SplitLevel {
+	return { unit: 'year', rangeLimit: Infinity, ...everyNYears(100) };
+}
+
+const COARSEST_RUNG: SplitLevel = /* @__PURE__ */ buildCoarsestRung();
 
 // The widening ladder, finest → coarsest. The splits function keeps the rungs at or above the
 // requested granularity, then picks the first whose rangeLimit covers the visible range — so
@@ -732,24 +668,28 @@ const COARSEST_RUNG: SplitLevel = { unit: 'year', rangeLimit: Infinity, ...every
 // those crossovers gradual: a bare day/week/month/quarter/year ladder collapses from a dense axis
 // to two or three ticks the moment the range crosses a limit, and stops widening past a few years.
 // The limits are in seconds; `rangeLimit` is the largest visible range the rung still handles.
-const SPLIT_LEVELS: SplitLevel[] = [
-	{ unit: 'day', rangeLimit: SECONDS_PER_DAY * 8, ...everyNDays(1) },
-	{ unit: 'day', rangeLimit: SECONDS_PER_DAY * 18, ...everyNDays(2) },
-	{ unit: 'day', rangeLimit: SECONDS_PER_DAY * 36, ...everyNDays(4) },
-	{ unit: 'week', rangeLimit: SECONDS_PER_DAY * 55, ...everyNWeeks(1) },
-	{ unit: 'week', rangeLimit: SECONDS_PER_DAY * 110, ...everyNWeeks(2) },
-	{ unit: 'month', rangeLimit: SECONDS_PER_DAY * 200, ...everyNMonths(1) },
-	{ unit: 'month', rangeLimit: SECONDS_PER_DAY * 400, ...everyNMonths(2) },
-	{ unit: 'quarter', rangeLimit: SECONDS_PER_DAY * 800, ...everyNMonths(3) },
-	{ unit: 'quarter', rangeLimit: SECONDS_PER_DAY * 1600, ...everyNMonths(6) },
-	{ unit: 'year', rangeLimit: APPROXIMATE_YEAR * 13, ...everyNYears(1) },
-	{ unit: 'year', rangeLimit: APPROXIMATE_YEAR * 26, ...everyNYears(2) },
-	{ unit: 'year', rangeLimit: APPROXIMATE_YEAR * 65, ...everyNYears(5) },
-	{ unit: 'year', rangeLimit: APPROXIMATE_YEAR * 130, ...everyNYears(10) },
-	{ unit: 'year', rangeLimit: APPROXIMATE_YEAR * 330, ...everyNYears(25) },
-	{ unit: 'year', rangeLimit: APPROXIMATE_YEAR * 650, ...everyNYears(50) },
-	COARSEST_RUNG
-];
+function buildSplitLevels(): SplitLevel[] {
+	return [
+		{ unit: 'day', rangeLimit: SECONDS_PER_DAY * 8, ...everyNDays(1) },
+		{ unit: 'day', rangeLimit: SECONDS_PER_DAY * 18, ...everyNDays(2) },
+		{ unit: 'day', rangeLimit: SECONDS_PER_DAY * 36, ...everyNDays(4) },
+		{ unit: 'week', rangeLimit: SECONDS_PER_DAY * 55, ...everyNWeeks(1) },
+		{ unit: 'week', rangeLimit: SECONDS_PER_DAY * 110, ...everyNWeeks(2) },
+		{ unit: 'month', rangeLimit: SECONDS_PER_DAY * 200, ...everyNMonths(1) },
+		{ unit: 'month', rangeLimit: SECONDS_PER_DAY * 400, ...everyNMonths(2) },
+		{ unit: 'quarter', rangeLimit: SECONDS_PER_DAY * 800, ...everyNMonths(3) },
+		{ unit: 'quarter', rangeLimit: SECONDS_PER_DAY * 1600, ...everyNMonths(6) },
+		{ unit: 'year', rangeLimit: APPROXIMATE_YEAR * 13, ...everyNYears(1) },
+		{ unit: 'year', rangeLimit: APPROXIMATE_YEAR * 26, ...everyNYears(2) },
+		{ unit: 'year', rangeLimit: APPROXIMATE_YEAR * 65, ...everyNYears(5) },
+		{ unit: 'year', rangeLimit: APPROXIMATE_YEAR * 130, ...everyNYears(10) },
+		{ unit: 'year', rangeLimit: APPROXIMATE_YEAR * 330, ...everyNYears(25) },
+		{ unit: 'year', rangeLimit: APPROXIMATE_YEAR * 650, ...everyNYears(50) },
+		COARSEST_RUNG
+	];
+}
+
+const SPLIT_LEVELS: SplitLevel[] = /* @__PURE__ */ buildSplitLevels();
 
 export interface SplitsForTimeOptions {
 	/**
