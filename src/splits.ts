@@ -195,7 +195,12 @@ function stepGrid(
 	digits: number,
 	lower: number,
 	upper: number,
-	into: TickCollector
+	into: TickCollector,
+	// What the caller can actually change, spelled in that caller's own option names. The diagnosis
+	// below is shared, but the remedy is not: splitsForCategory's caller controls neither the range
+	// (it is the data) nor a `step` they most likely never set, so telling them to widen one is
+	// telling them to do something they cannot do.
+	densityRemedy: string
 ): number[] {
 	// Whether a grid is placeable at all is a property of the magnitude its ticks sit at, not of
 	// how far the anchor happens to be from the window: at 1.7e18 a 1000-unit step lands on
@@ -246,8 +251,8 @@ function stepGrid(
 	// ticks is already past any usable density, so refusing one sooner changes only the message.
 	if (Math.floor((upper - anchor) / step) - firstIndex + 2 > MAX_TICK_CANDIDATES) {
 		into.warn(
-			`the range spans more than ${MAX_TICK_CANDIDATES} ticks at this step — ` +
-				'widen the step or narrow the range'
+			`the visible range holds more than ${MAX_TICK_CANDIDATES - 1} ticks at this step, which ` +
+				`is past any readable density — no ticks at all rather than a partial grid. ${densityRemedy}`
 		);
 		return into.values;
 	}
@@ -1039,17 +1044,26 @@ export function splitsForLog(options: SplitsForLogOptions = {}): SplitsFn {
 		const firstPower = Math.floor(Math.log(scaleMin) / logBase);
 		const lastPower = Math.ceil(Math.log(scaleMax) / logBase);
 
-		// How many decades the sweep would visit is arithmetic, so it is asked before walking, the
+		// How many candidates the sweep would push is arithmetic, so it is asked before walking, the
 		// same way stepGrid asks its tick count. A base near 1 (the guard admits any base > 1) makes
 		// a decade a hair wide, so an ordinary range spans tens of thousands of them: the walk would
 		// then push ~10000 near-identical ticks into a sliver of the axis and fire the candidate cap,
 		// handing back a low-end prefix that still looks like a real axis — the failure stepGrid
-		// refuses rather than truncates. Refuse on the same rule. A base of 2 or 10 spans at most
-		// ~2100 decades across the entire double range, so this only ever bites a pathological base.
-		if (lastPower - firstPower + 1 > MAX_TICK_CANDIDATES) {
+		// refuses rather than truncates. Refuse on the same rule.
+		//
+		// Counted per *candidate*, not per decade: the loop below pushes the decade plus one value
+		// per minor mantissa, so a decade count comfortably inside the cap could still overflow it
+		// by up to the mantissa factor and truncate anyway — which is the one outcome this guard
+		// exists to prevent. With `minor: false` the mantissa list is empty and this is one per
+		// decade, exactly as before. A base of 2 or 10 spans at most ~2100 decades across the entire
+		// double range, so at the default mantissa count this only ever bites a pathological base.
+		const decades = lastPower - firstPower + 1;
+		const candidates = decades * (1 + mantissas.length);
+		if (candidates > MAX_TICK_CANDIDATES) {
 			warn(
-				`the range spans more than ${MAX_TICK_CANDIDATES} decades at base ${base} — ` +
-					'use a base further from 1, or narrow the range'
+				`the range spans ${decades} decades at base ${base}, which with ${mantissas.length} ` +
+					`minor mantissas would need ${candidates} ticks (more than ${MAX_TICK_CANDIDATES}) — ` +
+					'use a base further from 1, narrow the range, or pass fewer minorMantissas'
 			);
 			return [];
 		}
@@ -1101,6 +1115,13 @@ export interface SplitsForStepOptions {
 	 * Fixed spacing between ticks, in axis units. Required and has no default — a grid with
 	 * no spacing is not a grid; a value that is not finite and positive warns once and ticks
 	 * nothing.
+	 *
+	 * A step small enough that the visible range holds more than 9999 ticks is refused outright:
+	 * that whole range ticks *nothing*, warned once, rather than returning the low-end prefix a
+	 * truncated walk would give (see the factory's own docs for why, and for why
+	 * {@link splitsWithLimit} cannot rescue it). The threshold is on the visible range, not on the
+	 * data, so it moves as the user zooms — an hourly grid on a Unix-seconds axis crosses it at
+	 * about 14 months.
 	 */
 	step: number;
 	/**
@@ -1125,6 +1146,16 @@ export interface SplitsForStepOptions {
  * Only real grid positions are emitted, so a range containing none — including a zero-width
  * range whose single value is off-grid — yields no ticks; wrap with {@link splitsWithEdges}
  * for a range-edge fallback.
+ *
+ * There is an upper density limit, and it is a cliff rather than a slope: a visible range holding
+ * more than 9999 ticks at this `step` gets **no ticks at all**, warned once. Both sides of that
+ * cliff are unusable — 9999 gridlines on an 800px plot is not an axis either — but the failure is
+ * silent-looking, so it is worth knowing which zoom level reaches it. Refusing is deliberate: the
+ * alternative is a walk that stops at the cap and hands back the *low end* of the range, which
+ * still looks like a real axis while leaving most of the plot bare. Note that wrapping in
+ * {@link splitsWithLimit} does not rescue this — that decorator thins what the inner function
+ * emitted, and here it emitted nothing. The fix is a wider `step` (or a narrower scale range),
+ * chosen by the caller because only they know which.
  *
  * @example
  * ```ts
@@ -1188,7 +1219,15 @@ export function splitsForStep(options: SplitsForStepOptions): SplitsFn {
 
 		// Not re-normalized: stepGrid already returns an ascending, unique, in-range grid, and
 		// normalize()'s clamp would re-test its rounded ticks against the raw bounds.
-		return stepGrid(anchor, step, digits, scaleMin, scaleMax, makeCollector(warn));
+		return stepGrid(
+			anchor,
+			step,
+			digits,
+			scaleMin,
+			scaleMax,
+			makeCollector(warn),
+			'Widen `step`, or narrow the scale range.'
+		);
 	};
 }
 
@@ -1201,6 +1240,11 @@ export interface SplitsForCategoryOptions {
 	 * `scales.x.range`, or an ordinal y scale, which uPlot does pad — gets no ticks in the
 	 * region past the last category. A value that is not a whole count warns once and is
 	 * ignored.
+	 *
+	 * More than 9999 ticks in the visible range is refused outright — that axis ticks nothing,
+	 * warned once, rather than returning a truncated prefix. At the default `step` of 1 that means
+	 * a `count` of 10000 or more; raise {@link SplitsForCategoryOptions.step} to bring the tick
+	 * count back under it.
 	 * @default undefined — no clamping beyond the visible scale range
 	 */
 	count?: number;
@@ -1209,6 +1253,10 @@ export interface SplitsForCategoryOptions {
 	 * other bar on a dense category axis. Must be a positive whole number — category
 	 * indices are whole numbers, so a fractional step describes no tick that any category
 	 * sits behind; one warns once and falls back to the default.
+	 *
+	 * This is also the lever for the density limit described on
+	 * {@link SplitsForCategoryOptions.count}: it is what divides the tick count, where on a
+	 * category axis the range is not something the caller can narrow.
 	 * @default 1
 	 */
 	step?: number;
@@ -1288,7 +1336,18 @@ export function splitsForCategory(options: SplitsForCategoryOptions = {}): Split
 		}
 
 		// Category indices are the zero-anchored case of splitsForStep's own grid.
-		return stepGrid(0, step, 0, lowerBound, upperBound, makeCollector(warn));
+		return stepGrid(
+			0,
+			step,
+			0,
+			lowerBound,
+			upperBound,
+			makeCollector(warn),
+			// Not "narrow the range": on a category axis the range *is* the categories. `step` is the
+			// one lever this caller has, and at this density it is the right one — an axis with this
+			// many categories wants every Nth label, not every label.
+			'Raise `step` to label every Nth category.'
+		);
 	};
 }
 

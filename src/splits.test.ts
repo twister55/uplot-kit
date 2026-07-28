@@ -848,7 +848,39 @@ describe('splitsForLog', () => {
 			// dense low-end prefix that still looks like a real axis
 			expect(splitsForLog({ base: 1.0001 as 10 })(fakeSelf(), 0, 1, 10, 0, 0)).toEqual([]);
 			expect(warn).toHaveBeenCalledOnce();
-			expect(warn.mock.calls[0]?.[0]).toContain('more than 10000 decades at base 1.0001');
+			expect(warn.mock.calls[0]?.[0]).toContain('spans 23029 decades at base 1.0001');
+		} finally {
+			warn.mockRestore();
+		}
+	});
+
+	it('counts candidates, not decades, so minor mantissas cannot overflow the cap', () => {
+		const warn = vi.spyOn(console, 'warn').mockImplementation(() => {});
+		try {
+			// The loop pushes the decade plus one value per minor mantissa, so a decade count well
+			// inside the cap still overflowed it by the mantissa factor -- and then truncated at the
+			// collector instead, returning the low-end prefix this guard exists to refuse. Measured
+			// before the fix: 10000 ticks whose largest was 20938 on a range reaching 1e6, i.e. the
+			// bottom 2% of the axis ticked and the rest bare, reported as a degenerate range.
+			const minorMantissas = [1.001, 1.002, 1.003, 1.004, 1.005, 1.006, 1.007, 1.008, 1.009];
+			const dense = splitsForLog({ base: 1.01 as 10, minor: true, minorMantissas });
+			expect(dense(fakeSelf(), 0, 1, 1e6, 0, 0)).toEqual([]);
+			expect(warn.mock.calls[0]?.[0]).toContain('9 minor mantissas');
+			expect(warn.mock.calls[0]?.[0]).toContain('fewer minorMantissas');
+		} finally {
+			warn.mockRestore();
+		}
+	});
+
+	it('still admits the default mantissa count across the whole double range', () => {
+		// The guard multiplies by (1 + mantissas.length), so it must not start refusing ordinary
+		// base-10 log axes: 601 decades x 9 candidates is comfortably inside the cap.
+		const warn = vi.spyOn(console, 'warn').mockImplementation(() => {});
+		try {
+			expect(
+				splitsForLog({ minor: true })(fakeSelf(), 0, 1e-300, 1e300, 0, 0).length
+			).toBeGreaterThan(5000);
+			expect(warn).not.toHaveBeenCalled();
 		} finally {
 			warn.mockRestore();
 		}
@@ -1106,7 +1138,7 @@ describe('splitsForStep', () => {
 			// recovers the part that was never generated
 			expect(splits(fakeSelf(), 0, 0, 1, 0, 0)).toEqual([]);
 			expect(warn).toHaveBeenCalledOnce();
-			expect(warn.mock.calls[0]?.[0]).toContain('widen the step or narrow the range');
+			expect(warn.mock.calls[0]?.[0]).toContain('Widen `step`, or narrow the scale range.');
 
 			// and the count is arithmetic, so this costs the same whether the range wants
 			// ten thousand ticks or a billion
@@ -1151,7 +1183,7 @@ describe('splitsForStep', () => {
 
 			expect(splits(fakeSelf(), 0, 0, 1, 0, 0)).toEqual([]);
 			expect(warn).toHaveBeenCalledTimes(2);
-			expect(warn.mock.calls[1]?.[0]).toContain('widen the step or narrow the range');
+			expect(warn.mock.calls[1]?.[0]).toContain('Widen `step`, or narrow the scale range.');
 
 			// but a repeat of either condition still stays quiet, per redraw
 			splits(fakeSelf(), 0, 0, 1, 0, 0);
@@ -1432,6 +1464,39 @@ describe('splitsForCategory', () => {
 		const result = splits(fakeSelf(), 0, 0, 4, 0, 0);
 
 		expect(result).toEqual([0, 1, 2, 3, 4]);
+	});
+
+	it('offers a remedy its own caller can act on at the density ceiling', () => {
+		const warn = vi.spyOn(console, 'warn').mockImplementation(() => {});
+		try {
+			// The shared grid used to hand this caller splitsForStep's remedy verbatim -- "widen the
+			// step or narrow the range" -- naming two things a category axis does not have: the range
+			// is the categories, and `step` defaults to 1 and is most likely unset.
+			expect(splitsForCategory({ count: 10_000 })(fakeSelf(), 0, -0.5, 9999.5, 0, 0)).toEqual([]);
+			expect(warn).toHaveBeenCalledOnce();
+			expect(warn.mock.calls[0]?.[0]).toContain('Raise `step` to label every Nth category.');
+
+			// and that remedy works: the same axis at step 2 is back under the ceiling
+			expect(
+				splitsForCategory({ count: 10_000, step: 2 })(fakeSelf(), 0, -0.5, 9999.5, 0, 0)
+			).toHaveLength(5000);
+		} finally {
+			warn.mockRestore();
+		}
+	});
+
+	it('ticks right up to the ceiling before refusing', () => {
+		const warn = vi.spyOn(console, 'warn').mockImplementation(() => {});
+		try {
+			// 9999 is the real ceiling, not MAX_TICK_CANDIDATES -- the refusal is conservative by one
+			// for the isSameTick boundary. Documented on SplitsForCategoryOptions.count.
+			expect(splitsForCategory({ count: 9999 })(fakeSelf(), 0, -0.5, 9998.5, 0, 0)).toHaveLength(
+				9999
+			);
+			expect(warn).not.toHaveBeenCalled();
+		} finally {
+			warn.mockRestore();
+		}
 	});
 
 	it('thins to every Nth index when step is set', () => {
