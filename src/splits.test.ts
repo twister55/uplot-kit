@@ -1232,6 +1232,46 @@ describe('splitsForStep', () => {
 		expect(splits(fakeSelf(), 0, 0.25, 0.75, 0, 0)).toEqual([0.3, 0.4, 0.5, 0.6, 0.7]);
 	});
 
+	it('does not dirty a 15-decimal grid at magnitudes where decimal rounding degenerates', () => {
+		// The shared roundDec nudges by (1 + EPSILON) before rounding, which is what recovers a
+		// decimal a binary approximation missed by an ulp. The nudge is *relative*, though, so it
+		// grows with the value: once |value * 10 ** digits| passes 2^51 it is worth more than half a
+		// unit and the rounding turns into unconditional round-away-from-zero. 15 decimals is inside
+		// the decimal budget, so only the magnitude says so — at ticks from ~2.25 up, this grid came
+		// back as 3.123456789012346 and 14.123456789012348: noise digits added to values that
+		// arrived exact. Past that point the grid rounds by significant digits, the same recovery
+		// the two tests around this one rely on.
+		const anchor = 0.123456789012345;
+		const splits = splitsForStep({ step: 1, anchor });
+
+		// from anchor + 3, so every tick is past the 2.2518 the threshold works out to at 15 decimals
+		const result = splits(fakeSelf(), 0, anchor + 3, anchor + 14, 0, 0);
+
+		expect(result).toEqual([
+			3.12345678901234, 4.12345678901235, 5.12345678901235, 6.12345678901235, 7.12345678901235,
+			8.12345678901234, 9.12345678901234, 10.1234567890123, 11.1234567890123, 12.1234567890123,
+			13.1234567890123, 14.1234567890123
+		]);
+		// the shape behind those literals: no tick carries more significant digits than a double
+		// holds, which is the digit the nudge was writing noise into
+		for (const value of result) {
+			expect(Number(value.toPrecision(15))).toBe(value);
+		}
+	});
+
+	it('still rounds by decimals below that magnitude, keeping the grid exact', () => {
+		// The other side of the same threshold: 2.123456789012345 scaled by 1e15 is under 2^51, so
+		// the nudge is still worth less than half a unit and decimal rounding hands back the exact
+		// value the anchor names — all 16 significant digits of it. Significant-digit rounding would
+		// shorten it needlessly, so the threshold has to be on the product, not on `digits` alone.
+		const anchor = 0.123456789012345;
+		const splits = splitsForStep({ step: 1, anchor });
+
+		expect(splits(fakeSelf(), 0, anchor + 1, anchor + 2, 0, 0)).toEqual([
+			1.123456789012345, 2.123456789012345
+		]);
+	});
+
 	it('cleans float noise on a sub-1e-15-magnitude grid decimals cannot round', () => {
 		// below 1e-15 a double has more decimals than it can carry, so decimal rounding cannot help
 		// at all; significant-digit rounding is scale-free and cleans it. 3 * 7e-16 is

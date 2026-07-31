@@ -108,23 +108,44 @@ function roundSignificant(value: number): number {
 	return Number.isFinite(value) ? Number(value.toPrecision(SIGNIFICANT_DIGITS)) : value;
 }
 
+// Largest scaled magnitude the shared roundDec still rounds honestly. Its `(1 + EPSILON)` nudge is a
+// relative one, so it grows with the value it is applied to: past |value * 10 ** digits| = 2^51 the
+// nudge is more than half a unit and the rounding degenerates into unconditional
+// round-away-from-zero, moving values that were already exact instead of recovering ones an ulp off.
+// MAX_EXACT_DECIMALS bounds `digits`, but the degeneracy is a property of the *product*, so a
+// 15-decimal grid reaches it while still inside that bound — at ticks past ~2.25, where a grid
+// anchored at 0.123456789012345 handed back 3.123456789012346 for a value that arrived exact.
+const MAX_EXACT_SCALED = 2 ** 51;
+
 // The rounding stepGrid applies to a raw grid value. Decimal-place rounding (the shared roundDec)
 // is the right tool for an ordinary fractional step — it is exact and recovers the decimal the
-// caller wrote (`3 * 0.1` back to `0.3`) — but it has nothing left to work with once `digits`
-// exceeds 15, and a step or anchor whose own shortest decimal is longer than that reaches exactly
-// there: `1/3` is "0.3333333333333333" (16 digits), `0.1 + 0.2` is "0.30000000000000004" (17), and
-// any step at a magnitude below ~1e-15 needs more decimals than a double carries. Left to decimal
-// rounding alone the whole grid then came out in float noise (a clean `0.1` step under a noisy
-// anchor emitting `0.6000000000000001`). Past that threshold this falls back to significant-digit
-// rounding — the same scale-free rule splitsForLog already uses to clean both magnitude ends with
-// one pass.
+// caller wrote (`3 * 0.1` back to `0.3`) — but it stops being one at two edges, and both take the
+// same recovery.
 //
-// This threshold is the reason roundDec needs no guard of its own for this module: it is never
-// called past MAX_EXACT_DECIMALS from here. incrs does call it past that — the base-2 ladder rounds
-// at up to 53 decimals, on purpose, to stay bit-identical to uPlot's — which is why the guard
-// belongs at each call site rather than in the shared helper.
-function roundGridValue(value: number, digits: number): number {
-	return digits > MAX_EXACT_DECIMALS ? roundSignificant(value) : roundDec(value, digits);
+// The first is `digits` itself: past 15 there is nothing left to round to, and a step or anchor
+// whose own shortest decimal is longer than that reaches exactly there — `1/3` is
+// "0.3333333333333333" (16 digits), `0.1 + 0.2` is "0.30000000000000004" (17), and any step at a
+// magnitude below ~1e-15 needs more decimals than a double carries. Left to decimal rounding alone
+// the whole grid then came out in float noise (a clean `0.1` step under a noisy anchor emitting
+// `0.6000000000000001`).
+//
+// The second is the value's own magnitude, at any `digits`: see MAX_EXACT_SCALED. This one is the
+// sharper of the two, because it does not merely fail to clean — it dirties, adding noise digits to
+// a tick that was already the exact decimal the caller's anchor and step name.
+//
+// Both fall back to significant-digit rounding, the same scale-free rule splitsForLog uses to clean
+// both magnitude ends with one pass, and the right one here too: the values in either band carry
+// about one significant digit more than a double can hold, which is precisely the digit the noise
+// lives in.
+//
+// These two thresholds are the reason roundDec needs no guard of its own for this module. incrs
+// calls it past MAX_EXACT_DECIMALS on purpose — the base-2 ladder rounds at up to 53 decimals to
+// stay bit-identical to uPlot's — which is why the guard belongs at each call site rather than in
+// the shared helper.
+function roundGridValue(value: number, digits: number, maxExactValue: number): number {
+	return digits > MAX_EXACT_DECIMALS || Math.abs(value) > maxExactValue
+		? roundSignificant(value)
+		: roundDec(value, digits);
 }
 
 // Folds `-0` onto `+0`. Every tick-producing path that can reach zero from below — stepGrid's grid
@@ -215,10 +236,15 @@ function stepGrid(
 		return into.values;
 	}
 
+	// Hoisted out of the two per-tick call sites below: `digits` is fixed for the whole grid, so the
+	// magnitude at which decimal rounding stops being exact is fixed with it, and computing the
+	// power per tick is the cost the POW10 table in ./utils exists to avoid.
+	const maxExactValue = MAX_EXACT_SCALED / 10 ** digits;
+
 	const gridValue = (index: number): number => anchor + index * step;
 	const isAtOrAbove = (index: number): boolean => {
 		const raw = gridValue(index);
-		const nearest = Math.max(raw, roundGridValue(raw, digits));
+		const nearest = Math.max(raw, roundGridValue(raw, digits, maxExactValue));
 		return nearest >= lower || isSameTick(nearest, lower);
 	};
 
@@ -263,7 +289,7 @@ function stepGrid(
 		if (!Number.isFinite(raw)) {
 			break;
 		}
-		const value = roundGridValue(raw, digits);
+		const value = roundGridValue(raw, digits, maxExactValue);
 		const nearest = Math.min(raw, value);
 		if (nearest > upper && !isSameTick(nearest, upper)) {
 			break;

@@ -255,6 +255,18 @@ function uplotCanStepBy(incr: number): boolean {
 	return uplotRoundDec(incr, numDec) === incr;
 }
 
+// Whether findIncr (uPlot.esm.js:2885) can ever *return* this increment, which is the other half of
+// "usable" -- it refuses one whose recorded decimal count leaves no room for the value's own integer
+// digits: `intDigits + (foundIncr < 5 ? fixedDec.get(foundIncr) : 0) <= 17`. numIntDigits never
+// answers below 1, so a rung under 5 carrying more than 16 recorded decimals is not a tick uPlot
+// might decline to pick at some zoom -- it is one it will never pick at any zoom, on any range.
+function uplotCanEverSelect(incr: number): boolean {
+	if (incr >= 5) {
+		return true;
+	}
+	return 1 + (UPLOT_FIXED_DEC.get(incr) ?? uplotGuessDec(incr)) <= 17;
+}
+
 const FACADES: Record<IncrsByUnitKind, () => number[]> = {
 	byte: incrsForBytes,
 	kilobyte: incrsForKilobytes,
@@ -299,6 +311,24 @@ describe('every emitted increment is one uPlot can actually step by', () => {
 
 	it.each(ALL_KINDS)('holds for every increment of the %s facade', (kind) => {
 		expect(FACADES[kind]().filter((incr) => !uplotCanStepBy(incr))).toStrictEqual([]);
+	});
+
+	// Stepping is one half; being picked in the first place is the other, and it is the half that
+	// silently capped the megabyte ladder. uPlot registers dec = |exp| for its own base-2 family, so
+	// 2^-17 and finer carry 17+ decimals and fail findIncr's label-budget test at every zoom -- the
+	// ladder used to ship four such rungs under the banner of resolving down to a single byte, and
+	// findIncr walked straight past all four to 2^-16 (16 bytes). This is what keeps that bound
+	// honest if the uplot peer range moves.
+	it.each(ALL_KINDS)('emits nothing findIncr can never pick, for the %s facade', (kind) => {
+		expect(FACADES[kind]().filter((incr) => !uplotCanEverSelect(incr))).toStrictEqual([]);
+	});
+
+	it('holds the model honest here too: the trimmed megabyte rungs really were unpickable', () => {
+		expect(uplotCanEverSelect(2 ** -16)).toBe(true);
+		expect(uplotCanEverSelect(2 ** -17)).toBe(false);
+		expect(uplotCanEverSelect(2 ** -20)).toBe(false);
+		// and the kilobyte floor, which is why only the megabyte ladder needed trimming
+		expect(uplotCanEverSelect(2 ** -10)).toBe(true);
 	});
 
 	it('holds after the generic entry points drop what they cannot ship', () => {
@@ -358,9 +388,12 @@ describe('incrsFor* facades', () => {
 	});
 
 	describe('incrsForKilobytes / incrsForMegabytes', () => {
-		it('resolve down to a single byte, same as incrsForBytes', () => {
+		it('resolves down to a single byte in kilobytes, and to 16 bytes in megabytes', () => {
+			// The megabyte floor is not 2^-20: uPlot cannot pick a rung that fine on a megabyte-scaled
+			// axis at any zoom, so the ladder stops where it stops being usable. See the
+			// selectability test above for the arithmetic.
 			expect(Math.min(...incrsForKilobytes())).toBe(2 ** -10);
-			expect(Math.min(...incrsForMegabytes())).toBe(2 ** -20);
+			expect(Math.min(...incrsForMegabytes())).toBe(2 ** -16);
 			expect(incrsForKilobytes()).toContain(1024);
 			expect(incrsForMegabytes()).toContain(1024);
 		});
@@ -536,6 +569,22 @@ describe('incrsByUnit', () => {
 				// is false), and a negative spaced the axis backwards.
 				expect(incrsByUnit([Infinity, 0, NaN, -5, 5, 1])).toStrictEqual([1, 5]);
 				expect(warn.mock.calls[0]?.[0]).toContain('dropped 4 of 6 increments');
+			} finally {
+				warn.mockRestore();
+			}
+		});
+
+		it('does not blame minIncr/maxIncr for a ladder that arrived empty', () => {
+			const warn = vi.spyOn(console, 'warn').mockImplementation(() => {});
+			try {
+				// The empty-result warning names the bounds, which is right when the bounds are what
+				// admits nothing -- but an array that was empty to begin with was reported as "no
+				// increment is both >= -Infinity and <= Infinity", which reads as a bug in this package
+				// rather than in the caller's config.
+				expect(incrsByUnit([])).toStrictEqual([]);
+				expect(warn).toHaveBeenCalledOnce();
+				expect(warn.mock.calls[0]?.[0]).toContain('the ladder was empty before minIncr/maxIncr');
+				expect(warn.mock.calls[0]?.[0]).not.toContain('Infinity');
 			} finally {
 				warn.mockRestore();
 			}

@@ -71,16 +71,19 @@ const MAX_LADDER_EXPONENTS = 10_000;
 const EXPONENTIAL_NOTATION_FLOOR = 1e-6;
 
 // uPlot's pre-registered decimal counts for increments below EXPONENTIAL_NOTATION_FLOOR, mirrored
-// because nothing in uPlot exposes the map to ask. Built on first need: a ladder that never goes
-// sub-microsecond — every byte, bit and integer ladder here — never pays for it.
+// because nothing in uPlot exposes the map to ask. Built on first need: of the ladders below only
+// the seconds one reaches under the floor (it bottoms out at 1ns), so the byte, kilobyte, megabyte,
+// bit and integer ladders never pay for it.
 let uplotSteppableSmallIncrs: Set<number> | null = null;
 
 // Whether uPlot can actually *step* by this increment, which is not the same question as whether it
 // can pick it. numAxisSplits advances its loop variable with `roundDec(val + foundIncr, numDec)`,
 // where numDec is what uPlot recorded for that increment in its internal fixedDec map. For a static
-// `axis.incrs` array it records `guessDec(incr)` — the digits after the '.' in String(incr) — which
-// is 0 for anything below 1e-6, where String() switches to exponential notation. roundDec(3e-7, 0)
-// is 0, so `val` never moves: an unbounded splits.push that locks the browser tab, not a wrong axis.
+// `axis.incrs` array it records `guessDec(incr)` — the length of whatever follows the '.' in
+// String(incr) — and below 1e-6, where String() switches to exponential notation, that count is
+// never the one the value needs: `3e-7` holds no '.' at all and answers 0, while `1.5e-7` answers 4,
+// the length of the string "5e-7". Either way `roundDec(val + incr, numDec)` hands back the `val` it
+// was given: an unbounded splits.push that locks the browser tab, not a wrong axis.
 //
 // The escape is that uPlot pre-registers two families at module load whose decimal count comes from
 // genIncrs' own arithmetic instead of from guessDec, and those step correctly. Everything else below
@@ -115,8 +118,9 @@ function steppableIncrs(values: number[], warn: (detail: string) => void): numbe
 		warn(
 			`dropped ${dropped.length} increment(s) below ${EXPONENTIAL_NOTATION_FLOOR} that uPlot ` +
 				`cannot step by (${named}${dropped.length > 3 ? ', …' : ''}) — it reads their decimal ` +
-				'count as 0 and would loop forever building splits. To tick at that spacing, set ' +
-				'axis.splits to splitsForStep({ step }) instead of driving it through axis.incrs'
+				'count off an exponential string form, undercounts it, and would loop forever building ' +
+				'splits. To tick at that spacing, set axis.splits to splitsForStep({ step }) instead of ' +
+				'driving it through axis.incrs'
 		);
 	}
 	return steppable;
@@ -323,8 +327,17 @@ const BYTE_INCRS: readonly number[] = /* @__PURE__ */ incrsLadder(2, 0, 50, [1])
 /** Power-of-two increments for values measured in kilobytes, resolving down to 1 byte. */
 const KILOBYTE_INCRS: readonly number[] = /* @__PURE__ */ incrsLadder(2, -10, 50, [1]);
 
-/** Power-of-two increments for values measured in megabytes, resolving down to 1 byte. */
-const MEGABYTE_INCRS: readonly number[] = /* @__PURE__ */ incrsLadder(2, -20, 50, [1]);
+// The floor is 2^-16 (16 bytes), not the 2^-20 that would spell a single byte — a third thing
+// mirrored from uPlot's internals, alongside the two in isSteppableIncr. findIncr refuses any
+// increment whose recorded decimal count is longer than the label budget it has left,
+// `intDigits + (foundIncr < 5 ? fixedDec.get(foundIncr) : 0) <= 17` (uPlot.esm.js:2885), and uPlot's
+// own base-2 registration records `dec = |exp|`. numIntDigits never answers below 1, so a rung at
+// 2^-17 or finer fails that test at every zoom level and every scale range there is: findIncr walks
+// straight past it to 2^-16, whatever the data. Shipping those four rungs would only lengthen that
+// walk, so the ladder stops where uPlot stops being able to use it. Re-check this bound when the
+// uplot peer range moves.
+/** Power-of-two increments for values measured in megabytes, resolving down to 16 bytes. */
+const MEGABYTE_INCRS: readonly number[] = /* @__PURE__ */ incrsLadder(2, -16, 50, [1]);
 
 // uPlot's own default numeric ladder mixes in a 2.5 mantissa (…, 2, 2.5, 5, …), which produces
 // fractional ticks like 2.5 or 0.5 on an axis that only ever holds whole numbers. uPlot has an
@@ -521,18 +534,26 @@ function sanitizeIncrs(ladder: readonly number[]): number[] {
 function applyIncrsOptions(ladder: readonly number[], options: IncrsOptions | undefined): number[] {
 	const minIncr = incrsBound('minIncr', options?.minIncr, -Infinity);
 	const maxIncr = incrsBound('maxIncr', options?.maxIncr, Infinity);
-	const bounded = sanitizeIncrs(ladder).filter((incr) => incr >= minIncr && incr <= maxIncr);
+	const usable = sanitizeIncrs(ladder);
+	const bounded = usable.filter((incr) => incr >= minIncr && incr <= maxIncr);
 	// An empty axis.incrs is not "use uPlot's default": `axis.incrs || defaults` keeps an empty
 	// array because it is truthy, findIncr then finds nothing and returns [0, 0], and axesCalc
 	// bails before sizing the axis — leaving a blank gutter with no ticks, no gridlines and, until
-	// this warning, nothing at all on the console to say why. The bounds are named because the
-	// realistic way to get here is a pair that admits nothing (minIncr above maxIncr, or a floor
-	// past the top of the ladder), which reads as an ordinary filter right up until the axis
-	// disappears.
+	// this warning, nothing at all on the console to say why.
+	//
+	// Which half is at fault decides the message. Naming the bounds is right when they are what
+	// admits nothing (minIncr above maxIncr, or a floor past the top of the ladder) — that reads as
+	// an ordinary filter right up until the axis disappears. But a ladder that arrived empty, or
+	// that lost its last rung upstream, would be reported as `>= -Infinity and <= Infinity` under
+	// the same wording, which reads as a bug in this package rather than in the caller's array.
 	if (bounded.length === 0) {
 		warnOptions(
-			`no increment is both >= minIncr ${minIncr} and <= maxIncr ${maxIncr} — an empty ` +
-				'axis.incrs renders no ticks at all rather than falling back to the uPlot default'
+			usable.length === 0
+				? 'no increments to filter — the ladder was empty before minIncr/maxIncr were applied, ' +
+						'and an empty axis.incrs renders no ticks at all rather than falling back to the ' +
+						'uPlot default'
+				: `no increment is both >= minIncr ${minIncr} and <= maxIncr ${maxIncr} — an empty ` +
+						'axis.incrs renders no ticks at all rather than falling back to the uPlot default'
 		);
 	}
 	return bounded;
@@ -580,7 +601,9 @@ export function incrsForKilobytes(options?: IncrsOptions): number[] {
 
 /**
  * Power-of-two increments for a Y axis whose values are already scaled to megabytes, resolving
- * down to a single byte (2^-20 MB).
+ * down to 16 bytes (2^-16 MB). Not to a single byte, unlike {@link incrsForKilobytes}: uPlot's own
+ * increment picker rejects anything finer than that on a megabyte-scaled axis, whatever the data,
+ * so those rungs would never be chosen. Plot in kilobytes or bytes if you need to tick below it.
  * @example
  * ```ts
  * import uPlot from 'uplot';
