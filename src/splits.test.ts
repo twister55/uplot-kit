@@ -848,7 +848,39 @@ describe('splitsForLog', () => {
 			// dense low-end prefix that still looks like a real axis
 			expect(splitsForLog({ base: 1.0001 as 10 })(fakeSelf(), 0, 1, 10, 0, 0)).toEqual([]);
 			expect(warn).toHaveBeenCalledOnce();
-			expect(warn.mock.calls[0]?.[0]).toContain('more than 10000 decades at base 1.0001');
+			expect(warn.mock.calls[0]?.[0]).toContain('spans 23029 decades at base 1.0001');
+		} finally {
+			warn.mockRestore();
+		}
+	});
+
+	it('counts candidates, not decades, so minor mantissas cannot overflow the cap', () => {
+		const warn = vi.spyOn(console, 'warn').mockImplementation(() => {});
+		try {
+			// The loop pushes the decade plus one value per minor mantissa, so a decade count well
+			// inside the cap still overflowed it by the mantissa factor -- and then truncated at the
+			// collector instead, returning the low-end prefix this guard exists to refuse. Measured
+			// before the fix: 10000 ticks whose largest was 20938 on a range reaching 1e6, i.e. the
+			// bottom 2% of the axis ticked and the rest bare, reported as a degenerate range.
+			const minorMantissas = [1.001, 1.002, 1.003, 1.004, 1.005, 1.006, 1.007, 1.008, 1.009];
+			const dense = splitsForLog({ base: 1.01 as 10, minor: true, minorMantissas });
+			expect(dense(fakeSelf(), 0, 1, 1e6, 0, 0)).toEqual([]);
+			expect(warn.mock.calls[0]?.[0]).toContain('9 minor mantissas');
+			expect(warn.mock.calls[0]?.[0]).toContain('fewer minorMantissas');
+		} finally {
+			warn.mockRestore();
+		}
+	});
+
+	it('still admits the default mantissa count across the whole double range', () => {
+		// The guard multiplies by (1 + mantissas.length), so it must not start refusing ordinary
+		// base-10 log axes: 601 decades x 9 candidates is comfortably inside the cap.
+		const warn = vi.spyOn(console, 'warn').mockImplementation(() => {});
+		try {
+			expect(
+				splitsForLog({ minor: true })(fakeSelf(), 0, 1e-300, 1e300, 0, 0).length
+			).toBeGreaterThan(5000);
+			expect(warn).not.toHaveBeenCalled();
 		} finally {
 			warn.mockRestore();
 		}
@@ -1106,7 +1138,7 @@ describe('splitsForStep', () => {
 			// recovers the part that was never generated
 			expect(splits(fakeSelf(), 0, 0, 1, 0, 0)).toEqual([]);
 			expect(warn).toHaveBeenCalledOnce();
-			expect(warn.mock.calls[0]?.[0]).toContain('widen the step or narrow the range');
+			expect(warn.mock.calls[0]?.[0]).toContain('Widen `step`, or narrow the scale range.');
 
 			// and the count is arithmetic, so this costs the same whether the range wants
 			// ten thousand ticks or a billion
@@ -1151,7 +1183,7 @@ describe('splitsForStep', () => {
 
 			expect(splits(fakeSelf(), 0, 0, 1, 0, 0)).toEqual([]);
 			expect(warn).toHaveBeenCalledTimes(2);
-			expect(warn.mock.calls[1]?.[0]).toContain('widen the step or narrow the range');
+			expect(warn.mock.calls[1]?.[0]).toContain('Widen `step`, or narrow the scale range.');
 
 			// but a repeat of either condition still stays quiet, per redraw
 			splits(fakeSelf(), 0, 0, 1, 0, 0);
@@ -1198,6 +1230,46 @@ describe('splitsForStep', () => {
 		const splits = splitsForStep({ step: 0.1, anchor: 0.1 + 0.2 });
 
 		expect(splits(fakeSelf(), 0, 0.25, 0.75, 0, 0)).toEqual([0.3, 0.4, 0.5, 0.6, 0.7]);
+	});
+
+	it('does not dirty a 15-decimal grid at magnitudes where decimal rounding degenerates', () => {
+		// The shared roundDec nudges by (1 + EPSILON) before rounding, which is what recovers a
+		// decimal a binary approximation missed by an ulp. The nudge is *relative*, though, so it
+		// grows with the value: once |value * 10 ** digits| passes 2^51 it is worth more than half a
+		// unit and the rounding turns into unconditional round-away-from-zero. 15 decimals is inside
+		// the decimal budget, so only the magnitude says so — at ticks from ~2.25 up, this grid came
+		// back as 3.123456789012346 and 14.123456789012348: noise digits added to values that
+		// arrived exact. Past that point the grid rounds by significant digits, the same recovery
+		// the two tests around this one rely on.
+		const anchor = 0.123456789012345;
+		const splits = splitsForStep({ step: 1, anchor });
+
+		// from anchor + 3, so every tick is past the 2.2518 the threshold works out to at 15 decimals
+		const result = splits(fakeSelf(), 0, anchor + 3, anchor + 14, 0, 0);
+
+		expect(result).toEqual([
+			3.12345678901234, 4.12345678901235, 5.12345678901235, 6.12345678901235, 7.12345678901235,
+			8.12345678901234, 9.12345678901234, 10.1234567890123, 11.1234567890123, 12.1234567890123,
+			13.1234567890123, 14.1234567890123
+		]);
+		// the shape behind those literals: no tick carries more significant digits than a double
+		// holds, which is the digit the nudge was writing noise into
+		for (const value of result) {
+			expect(Number(value.toPrecision(15))).toBe(value);
+		}
+	});
+
+	it('still rounds by decimals below that magnitude, keeping the grid exact', () => {
+		// The other side of the same threshold: 2.123456789012345 scaled by 1e15 is under 2^51, so
+		// the nudge is still worth less than half a unit and decimal rounding hands back the exact
+		// value the anchor names — all 16 significant digits of it. Significant-digit rounding would
+		// shorten it needlessly, so the threshold has to be on the product, not on `digits` alone.
+		const anchor = 0.123456789012345;
+		const splits = splitsForStep({ step: 1, anchor });
+
+		expect(splits(fakeSelf(), 0, anchor + 1, anchor + 2, 0, 0)).toEqual([
+			1.123456789012345, 2.123456789012345
+		]);
 	});
 
 	it('cleans float noise on a sub-1e-15-magnitude grid decimals cannot round', () => {
@@ -1305,6 +1377,31 @@ describe('splitsWithInclude', () => {
 });
 
 describe('splitsWithLimit', () => {
+	it('does what its @example says it does', () => {
+		// The previous example claimed the limit thinned 21 year ticks to every other one, over a
+		// range where the inner generator returned 11 and the decorator was a complete no-op -- and
+		// an example is the first thing copied and the last thing re-read. So the replacement's
+		// arithmetic is pinned here: an hourly grid over a week is 169 ticks, thinned to 12.
+		const HOUR = 60 * 60;
+		const start = Date.UTC(2026, 0, 5) / 1000;
+		const end = start + 168 * HOUR;
+		const inner = splitsForStep({ step: HOUR });
+
+		expect(inner(fakeSelf(), 0, start, end, 0, 0)).toHaveLength(169);
+		expect(splitsWithLimit(inner, 12)(fakeSelf(), 0, start, end, 0, 0)).toHaveLength(12);
+	});
+
+	it('is a no-op over a generator that already thins itself, as the docs warn', () => {
+		// splitsForTime picks a rung from its own ladder to suit the range, so it rarely emits more
+		// than a dozen ticks -- which is why the rotted example above showed no thinning at all.
+		const inner = splitsForTime({ granularity: 'day' });
+		const lo = Date.UTC(2006, 0, 1) / 1000;
+		const hi = Date.UTC(2026, 0, 1) / 1000;
+
+		expect(inner(fakeSelf(), 0, lo, hi, 0, 0)).toHaveLength(11);
+		expect(splitsWithLimit(inner, 12)(fakeSelf(), 0, lo, hi, 0, 0)).toHaveLength(11);
+	});
+
 	it('returns the base ticks unchanged when within the limit', () => {
 		const wrapped = splitsWithLimit(splitsForStep({ step: 10 }), 10);
 
@@ -1432,6 +1529,39 @@ describe('splitsForCategory', () => {
 		const result = splits(fakeSelf(), 0, 0, 4, 0, 0);
 
 		expect(result).toEqual([0, 1, 2, 3, 4]);
+	});
+
+	it('offers a remedy its own caller can act on at the density ceiling', () => {
+		const warn = vi.spyOn(console, 'warn').mockImplementation(() => {});
+		try {
+			// The shared grid used to hand this caller splitsForStep's remedy verbatim -- "widen the
+			// step or narrow the range" -- naming two things a category axis does not have: the range
+			// is the categories, and `step` defaults to 1 and is most likely unset.
+			expect(splitsForCategory({ count: 10_000 })(fakeSelf(), 0, -0.5, 9999.5, 0, 0)).toEqual([]);
+			expect(warn).toHaveBeenCalledOnce();
+			expect(warn.mock.calls[0]?.[0]).toContain('Raise `step` to label every Nth category.');
+
+			// and that remedy works: the same axis at step 2 is back under the ceiling
+			expect(
+				splitsForCategory({ count: 10_000, step: 2 })(fakeSelf(), 0, -0.5, 9999.5, 0, 0)
+			).toHaveLength(5000);
+		} finally {
+			warn.mockRestore();
+		}
+	});
+
+	it('ticks right up to the ceiling before refusing', () => {
+		const warn = vi.spyOn(console, 'warn').mockImplementation(() => {});
+		try {
+			// 9999 is the real ceiling, not MAX_TICK_CANDIDATES -- the refusal is conservative by one
+			// for the isSameTick boundary. Documented on SplitsForCategoryOptions.count.
+			expect(splitsForCategory({ count: 9999 })(fakeSelf(), 0, -0.5, 9998.5, 0, 0)).toHaveLength(
+				9999
+			);
+			expect(warn).not.toHaveBeenCalled();
+		} finally {
+			warn.mockRestore();
+		}
 	});
 
 	it('thins to every Nth index when step is set', () => {

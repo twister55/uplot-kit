@@ -8,6 +8,16 @@
 
 import type uPlot from 'uplot';
 
+import {
+	describeValue,
+	fractionDigits,
+	isPositiveFinite,
+	makeWarnOnce,
+	MAX_EXACT_DECIMALS,
+	optionOr,
+	roundDec
+} from './utils';
+
 const SECONDS_PER_DAY = 60 * 60 * 24;
 const SECONDS_PER_WEEK = 7 * SECONDS_PER_DAY;
 const APPROXIMATE_YEAR = 366 * SECONDS_PER_DAY;
@@ -55,56 +65,6 @@ function isTickable(scaleMin: number, scaleMax: number): boolean {
 	return Number.isFinite(scaleMin) && Number.isFinite(scaleMax) && scaleMin <= scaleMax;
 }
 
-// The rule two generators independently apply to a length-like option: splitsForTime's `ms` (axis
-// units per millisecond) and splitsForStep's `step` (grid spacing) both mean "nothing sensible to
-// scale/space by" unless finite and above zero. Only the predicate is shared — the recovery differs
-// on purpose (ms falls back to its default, step has none and ticks nothing), which is why this is a
-// bare boolean the callers branch on rather than a warn-and-fallback helper.
-function isPositiveFinite(value: number): boolean {
-	return Number.isFinite(value) && value > 0;
-}
-
-// One warn-once tracker per generator instance, so a chart that redraws every frame on a
-// degenerate range logs once, not per frame. Keyed by the message rather than by a single flag:
-// a generator can report structurally unrelated conditions (an unplaceable grid, a capped walk)
-// that are fixed by different things, so silencing one must not silence the others.
-function makeWarnOnce(source: string): (detail: string) => void {
-	const warned = new Set<string>();
-	return (detail) => {
-		if (!warned.has(detail)) {
-			warned.add(detail);
-			console.warn(`uplot-kit ${source}: ${detail}`);
-		}
-	};
-}
-
-// Factory-time option check, shared by every generator. The types below are narrow, but a value
-// they forbid still arrives from plain JavaScript or from a config object cast into shape — and
-// the expensive part is never the bad value itself, it is that guessing silently for it yields a
-// plausible-looking axis nobody thinks to distrust (`base: 0` ticking a lone 1, a fractional
-// `weekStartsOn` putting every week tick at midday). Each is named, reported once, and replaced
-// by the documented default, so the chart still renders and the console says why.
-//
-// Checked here rather than per redraw because none of these can change afterwards: the option is
-// closed over, so a per-call test re-answers a settled question on every frame.
-function optionOr<T>(
-	warn: (detail: string) => void,
-	name: string,
-	value: T,
-	isValid: boolean,
-	requirement: string,
-	fallback: T
-): T {
-	if (isValid) {
-		return value;
-	}
-	warn(
-		`${name} must be ${requirement}, got ${JSON.stringify(value)} — ` +
-			`falling back to ${JSON.stringify(fallback)}`
-	);
-	return fallback;
-}
-
 const CAP_REACHED =
 	`stopped after ${MAX_TICK_CANDIDATES} tick candidates — ` + 'the scale range looks degenerate';
 
@@ -133,43 +93,6 @@ function makeCollector(warn: (detail: string) => void): TickCollector {
 	return { values, push, warn };
 }
 
-// Number of digits after the decimal point in `value`'s own shortest decimal form, used to
-// round a computed tick back to exactly the precision its inputs carry. Exponential notation
-// (`1e-7`, whose string form has no decimal point at all) is handled by folding the exponent
-// into the mantissa's own digit count.
-function fractionDigits(value: number): number {
-	if (!Number.isFinite(value)) {
-		return 0;
-	}
-	const text = Math.abs(value).toString();
-	const exponentAt = text.indexOf('e');
-	if (exponentAt >= 0) {
-		const exponent = Number(text.slice(exponentAt + 1));
-		return Math.max(0, fractionDigits(Number(text.slice(0, exponentAt))) - exponent);
-	}
-	const dotAt = text.indexOf('.');
-	return dotAt < 0 ? 0 : text.length - dotAt - 1;
-}
-
-// Rounds a grid value to `digits` decimals, undoing the representation error that even exact
-// index math carries for fractional steps (`3 * 0.1 === 0.30000000000000004`). Past 15 digits a
-// double has no precision left to round to, so the value passes through untouched rather than
-// overflowing the 10**digits factor.
-// Every factor roundTo can ask for, resolved once. It runs per tick — a 200-tick axis was paying
-// 200 `10 ** digits` per redraw for a value that only ever takes these 16 forms — and each is
-// exact, since 1e15 is still under 2**53.
-const POW10 = Array.from({ length: 16 }, (_, exponent) => 10 ** exponent);
-
-function roundTo(value: number, digits: number): number {
-	if (digits <= 0 || digits > 15 || !Number.isFinite(value)) {
-		return value;
-	}
-	// `digits` is a whole number in 1..15 here, so the fallback is unreachable — it is how the
-	// lookup is spelled without a non-null assertion under noUncheckedIndexedAccess.
-	const factor = POW10[digits] ?? 10 ** digits;
-	return Math.round(value * factor) / factor;
-}
-
 // A double carries just under 16 significant decimal digits, so re-reading a value at 15 drops
 // the last digit — which is exactly where a product's representation error lives — and leaves
 // every value that was exact at that width untouched.
@@ -185,18 +108,44 @@ function roundSignificant(value: number): number {
 	return Number.isFinite(value) ? Number(value.toPrecision(SIGNIFICANT_DIGITS)) : value;
 }
 
-// The rounding stepGrid applies to a raw grid value. Decimal-place rounding (roundTo) is the right
-// tool for an ordinary fractional step — it is exact and recovers the decimal the caller wrote
-// (`3 * 0.1` back to `0.3`) — but it gives up once `digits` exceeds 15, and a step or anchor whose
-// own shortest decimal is longer than that reaches exactly there: `1/3` is "0.3333333333333333"
-// (16 digits), `0.1 + 0.2` is "0.30000000000000004" (17), and any step at a magnitude below ~1e-15
-// needs more decimals than a double carries. Left to roundTo alone the whole grid then came out in
-// float noise (a clean `0.1` step under a noisy anchor emitting `0.6000000000000001`). Past that
-// threshold this falls back to significant-digit rounding — the same scale-free rule splitsForLog
-// already uses to clean both magnitude ends with one pass. Below the threshold roundTo is unchanged,
-// so no ordinary grid rounds differently.
-function roundGridValue(value: number, digits: number): number {
-	return digits > 15 ? roundSignificant(value) : roundTo(value, digits);
+// Largest scaled magnitude the shared roundDec still rounds honestly. Its `(1 + EPSILON)` nudge is a
+// relative one, so it grows with the value it is applied to: past |value * 10 ** digits| = 2^51 the
+// nudge is more than half a unit and the rounding degenerates into unconditional
+// round-away-from-zero, moving values that were already exact instead of recovering ones an ulp off.
+// MAX_EXACT_DECIMALS bounds `digits`, but the degeneracy is a property of the *product*, so a
+// 15-decimal grid reaches it while still inside that bound — at ticks past ~2.25, where a grid
+// anchored at 0.123456789012345 handed back 3.123456789012346 for a value that arrived exact.
+const MAX_EXACT_SCALED = 2 ** 51;
+
+// The rounding stepGrid applies to a raw grid value. Decimal-place rounding (the shared roundDec)
+// is the right tool for an ordinary fractional step — it is exact and recovers the decimal the
+// caller wrote (`3 * 0.1` back to `0.3`) — but it stops being one at two edges, and both take the
+// same recovery.
+//
+// The first is `digits` itself: past 15 there is nothing left to round to, and a step or anchor
+// whose own shortest decimal is longer than that reaches exactly there — `1/3` is
+// "0.3333333333333333" (16 digits), `0.1 + 0.2` is "0.30000000000000004" (17), and any step at a
+// magnitude below ~1e-15 needs more decimals than a double carries. Left to decimal rounding alone
+// the whole grid then came out in float noise (a clean `0.1` step under a noisy anchor emitting
+// `0.6000000000000001`).
+//
+// The second is the value's own magnitude, at any `digits`: see MAX_EXACT_SCALED. This one is the
+// sharper of the two, because it does not merely fail to clean — it dirties, adding noise digits to
+// a tick that was already the exact decimal the caller's anchor and step name.
+//
+// Both fall back to significant-digit rounding, the same scale-free rule splitsForLog uses to clean
+// both magnitude ends with one pass, and the right one here too: the values in either band carry
+// about one significant digit more than a double can hold, which is precisely the digit the noise
+// lives in.
+//
+// These two thresholds are the reason roundDec needs no guard of its own for this module. incrs
+// calls it past MAX_EXACT_DECIMALS on purpose — the base-2 ladder rounds at up to 53 decimals to
+// stay bit-identical to uPlot's — which is why the guard belongs at each call site rather than in
+// the shared helper.
+function roundGridValue(value: number, digits: number, maxExactValue: number): number {
+	return digits > MAX_EXACT_DECIMALS || Math.abs(value) > maxExactValue
+		? roundSignificant(value)
+		: roundDec(value, digits);
 }
 
 // Folds `-0` onto `+0`. Every tick-producing path that can reach zero from below — stepGrid's grid
@@ -268,7 +217,12 @@ function stepGrid(
 	digits: number,
 	lower: number,
 	upper: number,
-	into: TickCollector
+	into: TickCollector,
+	// What the caller can actually change, spelled in that caller's own option names. The diagnosis
+	// below is shared, but the remedy is not: splitsForCategory's caller controls neither the range
+	// (it is the data) nor a `step` they most likely never set, so telling them to widen one is
+	// telling them to do something they cannot do.
+	densityRemedy: string
 ): number[] {
 	// Whether a grid is placeable at all is a property of the magnitude its ticks sit at, not of
 	// how far the anchor happens to be from the window: at 1.7e18 a 1000-unit step lands on
@@ -282,10 +236,15 @@ function stepGrid(
 		return into.values;
 	}
 
+	// Hoisted out of the two per-tick call sites below: `digits` is fixed for the whole grid, so the
+	// magnitude at which decimal rounding stops being exact is fixed with it, and computing the
+	// power per tick is the cost the POW10 table in ./utils exists to avoid.
+	const maxExactValue = MAX_EXACT_SCALED / 10 ** digits;
+
 	const gridValue = (index: number): number => anchor + index * step;
 	const isAtOrAbove = (index: number): boolean => {
 		const raw = gridValue(index);
-		const nearest = Math.max(raw, roundGridValue(raw, digits));
+		const nearest = Math.max(raw, roundGridValue(raw, digits, maxExactValue));
 		return nearest >= lower || isSameTick(nearest, lower);
 	};
 
@@ -319,8 +278,8 @@ function stepGrid(
 	// ticks is already past any usable density, so refusing one sooner changes only the message.
 	if (Math.floor((upper - anchor) / step) - firstIndex + 2 > MAX_TICK_CANDIDATES) {
 		into.warn(
-			`the range spans more than ${MAX_TICK_CANDIDATES} ticks at this step — ` +
-				'widen the step or narrow the range'
+			`the visible range holds more than ${MAX_TICK_CANDIDATES - 1} ticks at this step, which ` +
+				`is past any readable density — no ticks at all rather than a partial grid. ${densityRemedy}`
 		);
 		return into.values;
 	}
@@ -330,7 +289,7 @@ function stepGrid(
 		if (!Number.isFinite(raw)) {
 			break;
 		}
-		const value = roundGridValue(raw, digits);
+		const value = roundGridValue(raw, digits, maxExactValue);
 		const nearest = Math.min(raw, value);
 		if (nearest > upper && !isSameTick(nearest, upper)) {
 			break;
@@ -720,9 +679,26 @@ const DEFAULT_MS = 1e-3;
 // Decimal decades, matching uPlot's own default `log`.
 const DEFAULT_BASE = 10;
 
+// Both ladder constants below are built by a wrapper function called once behind a
+// `/* @__PURE__ */` annotation, rather than written as bare top-level literals. That shape is
+// load-bearing, not decorative: an object or array literal that *spreads another identifier*
+// (`{ unit: 'day', ..., ...everyNDays(1) }`) is not pruned even when annotated — evaluating a
+// spread isn't treated as inherently pure, unlike a spread-free literal — so as bare literals
+// these pinned themselves, and transitively every calendar walker, startOfDay/startOfWeek/
+// startOfMonth/startOfYear, utcMonthStart and the scratch Date, into *every* consumer bundle,
+// including one that imports nothing from this file. Measured with the two-pass check
+// (`pnpm build`, then esbuild --bundle --tree-shaking=true over a consumer importing only
+// `stackedBands`): 4959 bytes before, 1712 after. A single wrapped call is the one pattern that
+// sidesteps it — the same finding, with the same empirical backing, is written up at the ladders
+// in src/incrs.ts. Keep this shape when adding rungs.
+
 // The coarsest rung, hoisted so the range lookup below has a total fallback the compiler can see
 // is defined — its Infinity limit means the lookup never actually misses.
-const COARSEST_RUNG: SplitLevel = { unit: 'year', rangeLimit: Infinity, ...everyNYears(100) };
+function buildCoarsestRung(): SplitLevel {
+	return { unit: 'year', rangeLimit: Infinity, ...everyNYears(100) };
+}
+
+const COARSEST_RUNG: SplitLevel = /* @__PURE__ */ buildCoarsestRung();
 
 // The widening ladder, finest → coarsest. The splits function keeps the rungs at or above the
 // requested granularity, then picks the first whose rangeLimit covers the visible range — so
@@ -732,24 +708,28 @@ const COARSEST_RUNG: SplitLevel = { unit: 'year', rangeLimit: Infinity, ...every
 // those crossovers gradual: a bare day/week/month/quarter/year ladder collapses from a dense axis
 // to two or three ticks the moment the range crosses a limit, and stops widening past a few years.
 // The limits are in seconds; `rangeLimit` is the largest visible range the rung still handles.
-const SPLIT_LEVELS: SplitLevel[] = [
-	{ unit: 'day', rangeLimit: SECONDS_PER_DAY * 8, ...everyNDays(1) },
-	{ unit: 'day', rangeLimit: SECONDS_PER_DAY * 18, ...everyNDays(2) },
-	{ unit: 'day', rangeLimit: SECONDS_PER_DAY * 36, ...everyNDays(4) },
-	{ unit: 'week', rangeLimit: SECONDS_PER_DAY * 55, ...everyNWeeks(1) },
-	{ unit: 'week', rangeLimit: SECONDS_PER_DAY * 110, ...everyNWeeks(2) },
-	{ unit: 'month', rangeLimit: SECONDS_PER_DAY * 200, ...everyNMonths(1) },
-	{ unit: 'month', rangeLimit: SECONDS_PER_DAY * 400, ...everyNMonths(2) },
-	{ unit: 'quarter', rangeLimit: SECONDS_PER_DAY * 800, ...everyNMonths(3) },
-	{ unit: 'quarter', rangeLimit: SECONDS_PER_DAY * 1600, ...everyNMonths(6) },
-	{ unit: 'year', rangeLimit: APPROXIMATE_YEAR * 13, ...everyNYears(1) },
-	{ unit: 'year', rangeLimit: APPROXIMATE_YEAR * 26, ...everyNYears(2) },
-	{ unit: 'year', rangeLimit: APPROXIMATE_YEAR * 65, ...everyNYears(5) },
-	{ unit: 'year', rangeLimit: APPROXIMATE_YEAR * 130, ...everyNYears(10) },
-	{ unit: 'year', rangeLimit: APPROXIMATE_YEAR * 330, ...everyNYears(25) },
-	{ unit: 'year', rangeLimit: APPROXIMATE_YEAR * 650, ...everyNYears(50) },
-	COARSEST_RUNG
-];
+function buildSplitLevels(): SplitLevel[] {
+	return [
+		{ unit: 'day', rangeLimit: SECONDS_PER_DAY * 8, ...everyNDays(1) },
+		{ unit: 'day', rangeLimit: SECONDS_PER_DAY * 18, ...everyNDays(2) },
+		{ unit: 'day', rangeLimit: SECONDS_PER_DAY * 36, ...everyNDays(4) },
+		{ unit: 'week', rangeLimit: SECONDS_PER_DAY * 55, ...everyNWeeks(1) },
+		{ unit: 'week', rangeLimit: SECONDS_PER_DAY * 110, ...everyNWeeks(2) },
+		{ unit: 'month', rangeLimit: SECONDS_PER_DAY * 200, ...everyNMonths(1) },
+		{ unit: 'month', rangeLimit: SECONDS_PER_DAY * 400, ...everyNMonths(2) },
+		{ unit: 'quarter', rangeLimit: SECONDS_PER_DAY * 800, ...everyNMonths(3) },
+		{ unit: 'quarter', rangeLimit: SECONDS_PER_DAY * 1600, ...everyNMonths(6) },
+		{ unit: 'year', rangeLimit: APPROXIMATE_YEAR * 13, ...everyNYears(1) },
+		{ unit: 'year', rangeLimit: APPROXIMATE_YEAR * 26, ...everyNYears(2) },
+		{ unit: 'year', rangeLimit: APPROXIMATE_YEAR * 65, ...everyNYears(5) },
+		{ unit: 'year', rangeLimit: APPROXIMATE_YEAR * 130, ...everyNYears(10) },
+		{ unit: 'year', rangeLimit: APPROXIMATE_YEAR * 330, ...everyNYears(25) },
+		{ unit: 'year', rangeLimit: APPROXIMATE_YEAR * 650, ...everyNYears(50) },
+		COARSEST_RUNG
+	];
+}
+
+const SPLIT_LEVELS: SplitLevel[] = /* @__PURE__ */ buildSplitLevels();
 
 export interface SplitsForTimeOptions {
 	/**
@@ -1091,17 +1071,26 @@ export function splitsForLog(options: SplitsForLogOptions = {}): SplitsFn {
 		const firstPower = Math.floor(Math.log(scaleMin) / logBase);
 		const lastPower = Math.ceil(Math.log(scaleMax) / logBase);
 
-		// How many decades the sweep would visit is arithmetic, so it is asked before walking, the
+		// How many candidates the sweep would push is arithmetic, so it is asked before walking, the
 		// same way stepGrid asks its tick count. A base near 1 (the guard admits any base > 1) makes
 		// a decade a hair wide, so an ordinary range spans tens of thousands of them: the walk would
 		// then push ~10000 near-identical ticks into a sliver of the axis and fire the candidate cap,
 		// handing back a low-end prefix that still looks like a real axis — the failure stepGrid
-		// refuses rather than truncates. Refuse on the same rule. A base of 2 or 10 spans at most
-		// ~2100 decades across the entire double range, so this only ever bites a pathological base.
-		if (lastPower - firstPower + 1 > MAX_TICK_CANDIDATES) {
+		// refuses rather than truncates. Refuse on the same rule.
+		//
+		// Counted per *candidate*, not per decade: the loop below pushes the decade plus one value
+		// per minor mantissa, so a decade count comfortably inside the cap could still overflow it
+		// by up to the mantissa factor and truncate anyway — which is the one outcome this guard
+		// exists to prevent. With `minor: false` the mantissa list is empty and this is one per
+		// decade, exactly as before. A base of 2 or 10 spans at most ~2100 decades across the entire
+		// double range, so at the default mantissa count this only ever bites a pathological base.
+		const decades = lastPower - firstPower + 1;
+		const candidates = decades * (1 + mantissas.length);
+		if (candidates > MAX_TICK_CANDIDATES) {
 			warn(
-				`the range spans more than ${MAX_TICK_CANDIDATES} decades at base ${base} — ` +
-					'use a base further from 1, or narrow the range'
+				`the range spans ${decades} decades at base ${base}, which with ${mantissas.length} ` +
+					`minor mantissas would need ${candidates} ticks (more than ${MAX_TICK_CANDIDATES}) — ` +
+					'use a base further from 1, narrow the range, or pass fewer minorMantissas'
 			);
 			return [];
 		}
@@ -1153,6 +1142,13 @@ export interface SplitsForStepOptions {
 	 * Fixed spacing between ticks, in axis units. Required and has no default — a grid with
 	 * no spacing is not a grid; a value that is not finite and positive warns once and ticks
 	 * nothing.
+	 *
+	 * A step small enough that the visible range holds more than 9999 ticks is refused outright:
+	 * that whole range ticks *nothing*, warned once, rather than returning the low-end prefix a
+	 * truncated walk would give (see the factory's own docs for why, and for why
+	 * {@link splitsWithLimit} cannot rescue it). The threshold is on the visible range, not on the
+	 * data, so it moves as the user zooms — an hourly grid on a Unix-seconds axis crosses it at
+	 * about 14 months.
 	 */
 	step: number;
 	/**
@@ -1177,6 +1173,16 @@ export interface SplitsForStepOptions {
  * Only real grid positions are emitted, so a range containing none — including a zero-width
  * range whose single value is off-grid — yields no ticks; wrap with {@link splitsWithEdges}
  * for a range-edge fallback.
+ *
+ * There is an upper density limit, and it is a cliff rather than a slope: a visible range holding
+ * more than 9999 ticks at this `step` gets **no ticks at all**, warned once. Both sides of that
+ * cliff are unusable — 9999 gridlines on an 800px plot is not an axis either — but the failure is
+ * silent-looking, so it is worth knowing which zoom level reaches it. Refusing is deliberate: the
+ * alternative is a walk that stops at the cap and hands back the *low end* of the range, which
+ * still looks like a real axis while leaving most of the plot bare. Note that wrapping in
+ * {@link splitsWithLimit} does not rescue this — that decorator thins what the inner function
+ * emitted, and here it emitted nothing. The fix is a wider `step` (or a narrower scale range),
+ * chosen by the caller because only they know which.
  *
  * @example
  * ```ts
@@ -1211,7 +1217,7 @@ export function splitsForStep(options: SplitsForStepOptions): SplitsFn {
 	// guess. A blank axis with no explanation is the most expensive failure in this file to
 	// track down, and it was the one a plain `step: 0` used to produce.
 	if (!isPositiveFinite(step)) {
-		warn(`step must be a finite number greater than zero, got ${JSON.stringify(step)} — no ticks`);
+		warn(`step must be a finite number greater than zero, got ${describeValue(step)} — no ticks`);
 		return () => [];
 	}
 
@@ -1240,7 +1246,15 @@ export function splitsForStep(options: SplitsForStepOptions): SplitsFn {
 
 		// Not re-normalized: stepGrid already returns an ascending, unique, in-range grid, and
 		// normalize()'s clamp would re-test its rounded ticks against the raw bounds.
-		return stepGrid(anchor, step, digits, scaleMin, scaleMax, makeCollector(warn));
+		return stepGrid(
+			anchor,
+			step,
+			digits,
+			scaleMin,
+			scaleMax,
+			makeCollector(warn),
+			'Widen `step`, or narrow the scale range.'
+		);
 	};
 }
 
@@ -1253,6 +1267,11 @@ export interface SplitsForCategoryOptions {
 	 * `scales.x.range`, or an ordinal y scale, which uPlot does pad — gets no ticks in the
 	 * region past the last category. A value that is not a whole count warns once and is
 	 * ignored.
+	 *
+	 * More than 9999 ticks in the visible range is refused outright — that axis ticks nothing,
+	 * warned once, rather than returning a truncated prefix. At the default `step` of 1 that means
+	 * a `count` of 10000 or more; raise {@link SplitsForCategoryOptions.step} to bring the tick
+	 * count back under it.
 	 * @default undefined — no clamping beyond the visible scale range
 	 */
 	count?: number;
@@ -1261,6 +1280,10 @@ export interface SplitsForCategoryOptions {
 	 * other bar on a dense category axis. Must be a positive whole number — category
 	 * indices are whole numbers, so a fractional step describes no tick that any category
 	 * sits behind; one warns once and falls back to the default.
+	 *
+	 * This is also the lever for the density limit described on
+	 * {@link SplitsForCategoryOptions.count}: it is what divides the tick count, where on a
+	 * category axis the range is not something the caller can narrow.
 	 * @default 1
 	 */
 	step?: number;
@@ -1322,7 +1345,7 @@ export function splitsForCategory(options: SplitsForCategoryOptions = {}): Split
 	let count = rawCount;
 	if (count !== undefined && !(Number.isInteger(count) && count >= 0)) {
 		warn(
-			`count must be a whole number of categories, got ${JSON.stringify(count)} — ` +
+			`count must be a whole number of categories, got ${describeValue(count)} — ` +
 				'ignoring it, so ticks are clamped to the visible range only'
 		);
 		count = undefined;
@@ -1340,7 +1363,18 @@ export function splitsForCategory(options: SplitsForCategoryOptions = {}): Split
 		}
 
 		// Category indices are the zero-anchored case of splitsForStep's own grid.
-		return stepGrid(0, step, 0, lowerBound, upperBound, makeCollector(warn));
+		return stepGrid(
+			0,
+			step,
+			0,
+			lowerBound,
+			upperBound,
+			makeCollector(warn),
+			// Not "narrow the range": on a category axis the range *is* the categories. `step` is the
+			// one lever this caller has, and at this density it is the right one — an axis with this
+			// many categories wants every Nth label, not every label.
+			'Raise `step` to label every Nth category.'
+		);
 	};
 }
 
@@ -1445,23 +1479,31 @@ export function splitsWithInclude(inner: SplitsFn, values: number[]): SplitsFn {
  * guarantee matters more; if both must hold, keep the injected values out of the thinned set by
  * some other means (e.g. a scale range pinned so the edge is a real tick the generator emits).
  *
+ * Pair it with a generator that does *not* thin itself. {@link splitsForTime} already picks a rung
+ * from its own ladder to suit the range, so it rarely emits more than a dozen ticks and this
+ * decorator is usually a no-op on top of it. {@link splitsForStep} and {@link splitsForCategory}
+ * are the ones that emit every grid position regardless of how many that is, and so are the ones
+ * with something to thin.
+ *
  * @example
  * ```ts
  * import uPlot from 'uplot';
- * import { splitsForTime, splitsWithLimit } from 'uplot-kit';
+ * import { splitsForStep, splitsWithLimit } from 'uplot-kit';
  *
- * // two decades of yearly samples: the ladder has already widened to year ticks, and the
- * // limit thins those 21 down to every other one
+ * const HOUR = 60 * 60;
+ * const start = Date.UTC(2026, 0, 5) / 1000;
  * const data: uPlot.AlignedData = [
- *   Array.from({ length: 21 }, (_, i) => Date.UTC(2006 + i, 0, 1) / 1000),
- *   Array.from({ length: 21 }, (_, i) => 100 + ((i * 7) % 23))
+ *   Array.from({ length: 169 }, (_, i) => start + i * HOUR),
+ *   Array.from({ length: 169 }, (_, i) => 100 + ((i * 7) % 23))
  * ];
  *
+ * // an hourly grid over a week is 169 ticks — every one a real bucket boundary, and far too
+ * // many to label. The limit keeps every 15th, so 12 survive; they are still on the hour.
  * const opts: uPlot.Options = {
  *   width: 800,
  *   height: 400,
  *   series: [{}, { label: 'value' }],
- *   axes: [{ splits: splitsWithLimit(splitsForTime({ granularity: 'day' }), 12) }, {}]
+ *   axes: [{ splits: splitsWithLimit(splitsForStep({ step: HOUR }), 12) }, {}]
  * };
  *
  * new uPlot(opts, data, document.body);
@@ -1508,19 +1550,20 @@ export function splitsWithLimit(inner: SplitsFn, maxTicks: number): SplitsFn {
  * splits remain, so their gridlines and tick marks still render), while dropping a tick here
  * removes it entirely — label, gridline, and tick mark.
  *
- * Wrap this *outside* {@link splitsWithEdges}, not inside it —
- * `splitsWithEdges(splitsWithFilter(inner, keep))` re-adds the range edges without passing
- * them through `keep`, so on a window the filter empties (a weekend-only zoom, say) the
- * fallback puts back exactly the ticks the filter removed. Wrapping the other way,
- * `splitsWithFilter(splitsWithEdges(inner), keep)`, filters the edges too.
+ * Wrap this *inside* {@link splitsWithEdges}, not outside it —
+ * `splitsWithEdges(splitsWithFilter(inner, keep))`. That order does mean the fallback re-adds the
+ * range edges without passing them through `keep`, so on a window the filter empties (a weekend-only
+ * zoom, say) the axis shows two edge ticks the predicate would have rejected. That is the lesser
+ * cost: wrapping the other way, `splitsWithFilter(splitsWithEdges(inner), keep)`, filters those
+ * edges out too and leaves the axis blank — the exact failure `splitsWithEdges` exists to prevent.
  *
- * The opposite order is right for {@link splitsWithInclude}: wrap this **inside** it, not outside.
- * `splitsWithFilter(splitsWithInclude(inner, [t]), keep)` runs `keep` over the injected `t` too, so
- * a `t` that fails the predicate is silently dropped every redraw — the guarantee `splitsWithInclude`
- * exists to make, gone. Wrap the other way, `splitsWithInclude(splitsWithFilter(inner, keep), [t])`,
- * and the filter only ever sees the generator's own ticks while `t` is injected afterward, kept
- * unconditionally. In short: a filter belongs between the generator and any decorator that
- * guarantees a tick, never on top of one.
+ * The same order is right for {@link splitsWithInclude}, for the same reason: wrap this **inside**
+ * it. `splitsWithFilter(splitsWithInclude(inner, [t]), keep)` runs `keep` over the injected `t` too,
+ * so a `t` that fails the predicate is silently dropped every redraw — the guarantee
+ * `splitsWithInclude` exists to make, gone. Wrap the other way,
+ * `splitsWithInclude(splitsWithFilter(inner, keep), [t])`, and the filter only ever sees the
+ * generator's own ticks while `t` is injected afterward, kept unconditionally. In short: a filter
+ * belongs between the generator and any decorator that guarantees a tick, never on top of one.
  *
  * @example
  * ```ts
