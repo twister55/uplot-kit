@@ -193,10 +193,32 @@ function ascendingUnique(values: number[]): number[] {
  *   ticks — the console warning is what points at the cause.
  * @example
  * ```ts
+ * import uPlot from 'uplot';
  * import { incrsLadder } from 'uplot-kit';
  *
- * // Decimal SI-style ladder in bits: 1, 2, 5, 10, 20, 50, 100, ...
- * const bitIncrs = incrsLadder(10, 0, 32, [1, 2, 5]);
+ * // Quarter-decade ladder: 1, 2.5, 5, 10, 25, 50, 100, ... — the denominations money is
+ * // counted in, and a mantissa set none of the incrsFor* facades ships. Spanning cents to
+ * // trillions rather than only the decades this data needs: uPlot picks an increment from
+ * // `axis.incrs` and nowhere else, so a value past the top rung leaves `findIncr` nothing to
+ * // return and that axis draws no ticks and no gridlines, silently. Size a ladder to the
+ * // widest value the axis could ever hold, not to the sample in front of you.
+ * const priceIncrs = incrsLadder(10, -2, 12, [1, 2.5, 5]);
+ *
+ * const start = Date.UTC(2026, 0, 1) / 1000; // axis values are Unix seconds
+ * const data: uPlot.AlignedData = [
+ *   [start, start + 60, start + 120],
+ *   [30, 190, 95]
+ * ];
+ *
+ * const opts: uPlot.Options = {
+ *   width: 800,
+ *   height: 400,
+ *   series: [{}, { label: 'price ($)' }],
+ *   // ticks every $25 — uPlot's own ladder would pick $20 here
+ *   axes: [{}, { incrs: priceIncrs }]
+ * };
+ *
+ * new uPlot(opts, data, document.body);
  * ```
  */
 export function incrsLadder(
@@ -243,8 +265,8 @@ export function incrsLadder(
 	const badIndex = mantissas.findIndex((mantissa) => !Number.isFinite(mantissa));
 	if (badIndex !== -1) {
 		warnLadder(
-			`mantissas must be finite numbers, got ${mantissas[badIndex]} at index ${badIndex} — ` +
-				'no increments'
+			`mantissas must be finite numbers, got ${describeValue(mantissas[badIndex])} ` +
+				`at index ${badIndex} — no increments`
 		);
 		return [];
 	}
@@ -456,6 +478,39 @@ const NANOSECOND_INCRS: readonly number[] = /* @__PURE__ */ buildNanosecondIncrs
 // Shared by every incrsFor* facade (and incrsByUnit, incrsStep) rather than given each its own
 // <Facade>Options type, unlike splits.ts's per-generator options — all nine facades take the same
 // minIncr/maxIncr shape, so a separate interface per facade would just be nine identical copies.
+/**
+ * Bounds on which rungs of a ladder an axis may pick, accepted by every `incrsFor*` facade, by
+ * {@link incrsByUnit} and by {@link incrsStep}.
+ *
+ * Note the asymmetry, which is why only the floor changes the picture below: uPlot picks the
+ * *smallest* rung that leaves room for a label, so raising the floor coarsens ticks that were
+ * too fine, while lowering the ceiling can never coarsen anything — it only takes rungs away,
+ * and taking away every rung that fits blanks the axis outright.
+ * @example
+ * ```ts
+ * import uPlot from 'uplot';
+ * import { incrsForSeconds } from 'uplot-kit';
+ *
+ * const start = Date.UTC(2026, 0, 1) / 1000; // axis values are Unix seconds
+ * const data: uPlot.AlignedData = [
+ *   [start, start + 60, start + 120],
+ *   [0, 240, 120]
+ * ];
+ *
+ * const opts: uPlot.Options = {
+ *   width: 800,
+ *   height: 400,
+ *   series: [{}, { label: 'job duration (s)' }],
+ *   // These durations are bucketed per minute, so a sub-minute tick would promise precision
+ *   // the data has not got: the floor gives 0, 60, 120, 180, 240 where the bare ladder picks
+ *   // 30s. The ceiling is a guard for the ranges this axis may hold later, not for this one —
+ *   // it drops the day/week/year rungs, and nothing here reaches them.
+ *   axes: [{}, { incrs: incrsForSeconds({ minIncr: 60, maxIncr: 3600 }) }]
+ * };
+ *
+ * new uPlot(opts, data, document.body);
+ * ```
+ */
 export interface IncrsOptions {
 	/**
 	 * Drops every increment below this value, so e.g. an axis for data bucketed no finer than a
@@ -567,12 +622,20 @@ function applyIncrsOptions(ladder: readonly number[], options: IncrsOptions | un
  * import uPlot from 'uplot';
  * import { incrsForBytes } from 'uplot-kit';
  *
+ * const start = Date.UTC(2026, 0, 1) / 1000; // axis values are Unix seconds
+ * const data: uPlot.AlignedData = [
+ *   [start, start + 60, start + 120],
+ *   [1024, 8192, 3072]
+ * ];
+ *
  * const opts: uPlot.Options = {
  *   width: 800,
  *   height: 400,
  *   series: [{}, { label: 'bytes sent' }],
  *   axes: [{}, { incrs: incrsForBytes() }]
  * };
+ *
+ * new uPlot(opts, data, document.body);
  * ```
  */
 export function incrsForBytes(options?: IncrsOptions): number[] {
@@ -587,12 +650,20 @@ export function incrsForBytes(options?: IncrsOptions): number[] {
  * import uPlot from 'uplot';
  * import { incrsForKilobytes } from 'uplot-kit';
  *
+ * const start = Date.UTC(2026, 0, 1) / 1000; // axis values are Unix seconds
+ * const data: uPlot.AlignedData = [
+ *   [start, start + 60, start + 120],
+ *   [4, 32, 12]
+ * ];
+ *
  * const opts: uPlot.Options = {
  *   width: 800,
  *   height: 400,
  *   series: [{}, { label: 'payload size (KB)' }],
  *   axes: [{}, { incrs: incrsForKilobytes() }]
  * };
+ *
+ * new uPlot(opts, data, document.body);
  * ```
  */
 export function incrsForKilobytes(options?: IncrsOptions): number[] {
@@ -609,12 +680,20 @@ export function incrsForKilobytes(options?: IncrsOptions): number[] {
  * import uPlot from 'uplot';
  * import { incrsForMegabytes } from 'uplot-kit';
  *
+ * const start = Date.UTC(2026, 0, 1) / 1000; // axis values are Unix seconds
+ * const data: uPlot.AlignedData = [
+ *   [start, start + 60, start + 120],
+ *   [12, 96, 40]
+ * ];
+ *
  * const opts: uPlot.Options = {
  *   width: 800,
  *   height: 400,
  *   series: [{}, { label: 'heap size (MB)' }],
  *   axes: [{}, { incrs: incrsForMegabytes() }]
  * };
+ *
+ * new uPlot(opts, data, document.body);
  * ```
  */
 export function incrsForMegabytes(options?: IncrsOptions): number[] {
@@ -630,12 +709,21 @@ export function incrsForMegabytes(options?: IncrsOptions): number[] {
  * import uPlot from 'uplot';
  * import { incrsForBits } from 'uplot-kit';
  *
+ * const start = Date.UTC(2026, 0, 1) / 1000; // axis values are Unix seconds
+ * const data: uPlot.AlignedData = [
+ *   [start, start + 60, start + 120],
+ *   [3000, 24000, 9000]
+ * ];
+ *
  * const opts: uPlot.Options = {
  *   width: 800,
  *   height: 400,
  *   series: [{}, { label: 'bitrate' }],
+ *   // ticks every 5 kbit — uPlot's own ladder would pick the 2.5 kbit mantissa here
  *   axes: [{}, { incrs: incrsForBits() }]
  * };
+ *
+ * new uPlot(opts, data, document.body);
  * ```
  */
 export function incrsForBits(options?: IncrsOptions): number[] {
@@ -650,12 +738,21 @@ export function incrsForBits(options?: IncrsOptions): number[] {
  * import uPlot from 'uplot';
  * import { incrsForIntegers } from 'uplot-kit';
  *
+ * const start = Date.UTC(2026, 0, 1) / 1000; // axis values are Unix seconds
+ * const data: uPlot.AlignedData = [
+ *   [start, start + 60, start + 120],
+ *   [3, 23, 11]
+ * ];
+ *
  * const opts: uPlot.Options = {
  *   width: 800,
  *   height: 400,
  *   series: [{}, { label: 'error count' }],
+ *   // ticks 5, 10, 15, ... — uPlot's own ladder would pick 2.5 on this range
  *   axes: [{}, { incrs: incrsForIntegers() }]
  * };
+ *
+ * new uPlot(opts, data, document.body);
  * ```
  */
 export function incrsForIntegers(options?: IncrsOptions): number[] {
@@ -670,12 +767,21 @@ export function incrsForIntegers(options?: IncrsOptions): number[] {
  * import uPlot from 'uplot';
  * import { incrsForSeconds } from 'uplot-kit';
  *
+ * const start = Date.UTC(2026, 0, 1) / 1000; // axis values are Unix seconds
+ * const data: uPlot.AlignedData = [
+ *   [start, start + 60, start + 120],
+ *   [300, 2700, 900]
+ * ];
+ *
  * const opts: uPlot.Options = {
  *   width: 800,
  *   height: 400,
- *   series: [{}, { label: 'request duration (s)' }],
+ *   series: [{}, { label: 'job duration (s)' }],
+ *   // ticks every 5 minutes (300, 600, 900, ...) — uPlot's own ladder would pick 500s
  *   axes: [{}, { incrs: incrsForSeconds() }]
  * };
+ *
+ * new uPlot(opts, data, document.body);
  * ```
  */
 export function incrsForSeconds(options?: IncrsOptions): number[] {
@@ -690,12 +796,21 @@ export function incrsForSeconds(options?: IncrsOptions): number[] {
  * import uPlot from 'uplot';
  * import { incrsForMilliseconds } from 'uplot-kit';
  *
+ * const start = Date.UTC(2026, 0, 1) / 1000; // axis values are Unix seconds
+ * const data: uPlot.AlignedData = [
+ *   [start, start + 60, start + 120],
+ *   [3000, 150000, 60000]
+ * ];
+ *
  * const opts: uPlot.Options = {
  *   width: 800,
  *   height: 400,
- *   series: [{}, { label: 'request duration (ms)' }],
+ *   series: [{}, { label: 'task duration (ms)' }],
+ *   // ticks every 30s (30000, 60000, 90000, ...) — uPlot's own ladder would pick 20000ms
  *   axes: [{}, { incrs: incrsForMilliseconds() }]
  * };
+ *
+ * new uPlot(opts, data, document.body);
  * ```
  */
 export function incrsForMilliseconds(options?: IncrsOptions): number[] {
@@ -710,12 +825,21 @@ export function incrsForMilliseconds(options?: IncrsOptions): number[] {
  * import uPlot from 'uplot';
  * import { incrsForMicroseconds } from 'uplot-kit';
  *
+ * const start = Date.UTC(2026, 0, 1) / 1000; // axis values are Unix seconds
+ * const data: uPlot.AlignedData = [
+ *   [start, start + 60, start + 120],
+ *   [3000, 24000, 9000]
+ * ];
+ *
  * const opts: uPlot.Options = {
  *   width: 800,
  *   height: 400,
  *   series: [{}, { label: 'query duration (µs)' }],
+ *   // ticks every 5ms — uPlot's own ladder would pick the 2.5ms mantissa here
  *   axes: [{}, { incrs: incrsForMicroseconds() }]
  * };
+ *
+ * new uPlot(opts, data, document.body);
  * ```
  */
 export function incrsForMicroseconds(options?: IncrsOptions): number[] {
@@ -730,12 +854,21 @@ export function incrsForMicroseconds(options?: IncrsOptions): number[] {
  * import uPlot from 'uplot';
  * import { incrsForNanoseconds } from 'uplot-kit';
  *
+ * const start = Date.UTC(2026, 0, 1) / 1000; // axis values are Unix seconds
+ * const data: uPlot.AlignedData = [
+ *   [start, start + 60, start + 120],
+ *   [3000, 24000, 9000]
+ * ];
+ *
  * const opts: uPlot.Options = {
  *   width: 800,
  *   height: 400,
  *   series: [{}, { label: 'syscall duration (ns)' }],
+ *   // ticks every 5µs — uPlot's own ladder would pick the 2.5µs mantissa here
  *   axes: [{}, { incrs: incrsForNanoseconds() }]
  * };
+ *
+ * new uPlot(opts, data, document.body);
  * ```
  */
 export function incrsForNanoseconds(options?: IncrsOptions): number[] {
@@ -795,12 +928,20 @@ const INCRS_FACADES: Record<IncrsByUnitKind, (options?: IncrsOptions) => number[
  * import uPlot from 'uplot';
  * import { incrsByUnit } from 'uplot-kit';
  *
+ * const start = Date.UTC(2026, 0, 1) / 1000; // axis values are Unix seconds
+ * const data: uPlot.AlignedData = [
+ *   [start, start + 60, start + 120],
+ *   [1024, 8192, 3072]
+ * ];
+ *
  * const opts: uPlot.Options = {
  *   width: 800,
  *   height: 400,
  *   series: [{}, { label: 'bytes sent' }],
  *   axes: [{}, { incrs: incrsByUnit('byte') }]
  * };
+ *
+ * new uPlot(opts, data, document.body);
  * ```
  */
 export function incrsByUnit(kind: IncrsByUnitKind | number[], options?: IncrsOptions): number[] {
@@ -870,19 +1011,56 @@ export interface IncrsStepOptions extends IncrsOptions {
  * import uPlot from 'uplot';
  * import { incrsStep } from 'uplot-kit';
  *
- * // Ticks only on 15-minute-candle boundaries: 900s, 1800s, 4500s, 9000s, ...
- * const candleIncrs = incrsStep(900);
+ * const POLL = 420; // a 7-minute polling interval, in seconds — no round unit divides it
  *
- * // Non-round multiples for an irregular bucket, e.g. a 15-minute candle where the only
- * // sensible wider ticks are 1h/4h/1d/1w boundaries (4, 16, 96, 672 buckets).
- * const sessionIncrs = incrsStep(900, { mults: [1, 4, 16, 96, 672] });
+ * // Every increment is a whole number of polls: 420s, 840s, 2100s, 4200s, ... This sets tick
+ * // *spacing*, not phase — uPlot anchors a time axis at the viewer's local midnight.
+ * const pollIncrs = incrsStep(POLL);
+ *
+ * const start = Date.UTC(2026, 0, 1, 9, 0) / 1000;
+ * const depth = [12, 31, 24, 47, 38, 55, 41, 63];
+ * const data: uPlot.AlignedData = [depth.map((_d, i) => start + i * POLL), depth];
+ *
+ * const opts: uPlot.Options = {
+ *   width: 800,
+ *   height: 400,
+ *   series: [{}, { label: 'queue depth' }],
+ *   // ticks 7 minutes apart — uPlot's own time ladder would pick 5, which no whole number
+ *   // of polls divides, so every tick spacing would cut across the cycle
+ *   axes: [{ incrs: pollIncrs }, {}]
+ * };
+ *
+ * new uPlot(opts, data, document.body);
+ * ```
+ * @example
+ * ```ts
+ * import uPlot from 'uplot';
+ * import { incrsStep } from 'uplot-kit';
+ *
+ * const CANDLE = 900; // a 15-minute candle, in seconds
+ *
+ * // 900s, 3600s, 14400s, 86400s, 604800s — each one a whole number of candles *and* a round
+ * // wall-clock span (1 candle, 1h, 4h, 1d, 1w). The default mults would offer 4500s and
+ * // 22500s — 5 and 25 candles — which are whole candles but land nowhere on the clock.
+ * const sessionIncrs = incrsStep(CANDLE, { mults: [1, 4, 16, 96, 672] });
+ *
+ * const start = Date.UTC(2026, 0, 1) / 1000;
+ * const close = Array.from({ length: 96 }, (_c, i) => 100 + Math.round(Math.sin(i / 6) * 8));
+ * const data: uPlot.AlignedData = [close.map((_c, i) => start + i * CANDLE), close];
  *
  * const opts: uPlot.Options = {
  *   width: 800,
  *   height: 400,
  *   series: [{}, { label: 'close' }],
- *   axes: [{ incrs: candleIncrs }, {}]
+ *   // over this one-day window it settles on 14400s — a tick every 4 hours, and since 4h
+ *   // divides the day those ticks land on the same six hours in every timezone. Plain
+ *   // incrsStep(CANDLE) picks 9000s: 2h30m divides neither the day nor the hour, so the
+ *   // grid drifts from day to day and every second tick sits on a half-hour that uPlot's
+ *   // labels at that increment then hide.
+ *   axes: [{ incrs: sessionIncrs }, {}]
  * };
+ *
+ * new uPlot(opts, data, document.body);
  * ```
  */
 export function incrsStep(step: number, options: IncrsStepOptions = {}): number[] {

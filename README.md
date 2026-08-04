@@ -10,7 +10,7 @@ composable functions you drop straight into uPlot's own options.
 [![license](https://img.shields.io/badge/license-MIT-3b82f6?style=flat-square)](./LICENSE)
 [![runtime deps](https://img.shields.io/badge/runtime%20deps-0-22c55e?style=flat-square)](#design-rules-non-negotiable)
 [![types](https://img.shields.io/badge/types-TypeScript%20strict-3178c6?style=flat-square&logo=typescript&logoColor=white)](#design-rules-non-negotiable)
-[![tests](https://img.shields.io/badge/tests-246%20passing-22c55e?style=flat-square&logo=vitest&logoColor=white)](#status)
+[![tests](https://img.shields.io/badge/tests-266%20passing-22c55e?style=flat-square&logo=vitest&logoColor=white)](#status)
 [![bundle](https://img.shields.io/badge/whole%20barrel-5.4%20kB%20min%2Bgzip-8b5cf6?style=flat-square)](#size)
 [![peer](https://img.shields.io/badge/peer-uPlot%20%5E1.6-ff6b6b?style=flat-square)](https://github.com/leeoniya/uPlot)
 [![module](https://img.shields.io/badge/module-ESM%20only-eab308?style=flat-square)](#compatibility)
@@ -24,15 +24,23 @@ re-writing the same handful of `axis.incrs` ladders and `axis.splits` callbacks 
 subtle bug in them.
 
 `uplot-kit` is that layer, extracted from a production charting codebase, stripped of its domain
-coupling, documented per option and pinned down by **246 tests**.
+coupling, documented per option and pinned down by **327 tests**.
 
 ```ts
+import type uPlot from 'uplot';
+import { incrsForBytes, splitsForTime } from 'uplot-kit';
+
 // before — a hand-rolled ladder, an off-by-one on month lengths, and a hung tab waiting
 // to happen the day someone passes a sub-microsecond increment
-axes: [{ splits: (u, i, min, max) => [/* 60 lines of calendar math */] }, { incrs: [1, 2, 5, 10] }];
+declare const sixtyLinesOfCalendarMath: uPlot.Axis.Splits;
+
+const before: uPlot.Axis[] = [{ splits: sixtyLinesOfCalendarMath }, { incrs: [1, 2, 5, 10] }];
 
 // after
-axes: [{ splits: splitsForTime({ granularity: 'day' }) }, { incrs: incrsForBytes() }];
+const after: uPlot.Axis[] = [
+	{ splits: splitsForTime({ granularity: 'day' }) },
+	{ incrs: incrsForBytes() }
+];
 ```
 
 Nothing here is a framework, a wrapper, or a theme. It is uPlot's own option values — built
@@ -53,8 +61,8 @@ though: three utility modules are implemented, exported from the barrel, and cov
 | 📦 npm release pipeline                                                                                         | 🚧 Planned — publication is gated                    |
 
 ```
-Test Files  4 passed (4)
-     Tests  246 passed (246)
+Test Files  6 passed (6)
+     Tests  327 passed (327)
 ```
 
 ## Install
@@ -122,8 +130,11 @@ Ladders of "nice" increments, so uPlot picks `15m` / `1h` / `1 KiB` rather than 
 Every ladder takes `{ minIncr, maxIncr }`, to clamp it to the resolution your data actually has:
 
 ```ts
+import type uPlot from 'uplot';
+import { incrsForSeconds } from 'uplot-kit';
+
 // data is bucketed to 5-minute intervals — never offer a finer tick
-axes: [{ incrs: incrsForSeconds({ minIncr: 300 }) }];
+const axes: uPlot.Axis[] = [{}, { scale: 'y', incrs: incrsForSeconds({ minIncr: 300 }) }];
 ```
 
 > **Why this isn't a one-liner you write yourself.** uPlot reads a tick's decimal count from an
@@ -156,15 +167,23 @@ Generators build a `SplitsFn`; decorators wrap one and return another, so they c
 | `splitsWithEdges(inner, { mode })` | Add the visible range's edges — `'always'`, or `'whenEmpty'` as a blank-axis fallback |
 
 ```ts
+import type uPlot from 'uplot';
 import { splitsForTime, splitsWithEdges, splitsWithFilter, splitsWithLimit } from 'uplot-kit';
 
 // order matters: filter innermost, edges outermost, so an edge tick is never filtered away
-const splits = splitsWithEdges(
-	splitsWithLimit(
-		splitsWithFilter(splitsForTime({ granularity: 'day', weekStartsOn: 1 }), (t) => t % 2 === 0),
-		10
-	)
-);
+const axes: uPlot.Axis[] = [
+	{
+		splits: splitsWithEdges(
+			splitsWithLimit(
+				splitsWithFilter(
+					splitsForTime({ granularity: 'day', weekStartsOn: 1 }),
+					(t) => t % 2 === 0
+				),
+				10
+			)
+		)
+	}
+];
 ```
 
 ### 🧱 `stacked` — stacked areas without the bookkeeping
@@ -198,7 +217,26 @@ Both take the same `omit` predicate, so a series hidden in your legend drops out
 the rest re-stack as if it were never there:
 
 ```ts
-const hidden = (seriesIdx: number) => !u.series[seriesIdx].show;
+import uPlot from 'uplot';
+import { stackedData } from 'uplot-kit';
+
+const raw: uPlot.AlignedData = [
+	[0, 1, 2],
+	[1, 2, 3],
+	[10, 20, 30]
+];
+
+const u = new uPlot(
+	{
+		width: 800,
+		height: 400,
+		series: [{}, { fill: 'tomato' }, { fill: 'steelblue' }]
+	},
+	stackedData(raw),
+	document.body
+);
+
+const hidden = (seriesIdx: number): boolean => u.series[seriesIdx]?.show !== true;
 
 u.setData(stackedData(raw, { omit: hidden }));
 ```
