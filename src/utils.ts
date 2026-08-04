@@ -161,7 +161,23 @@ export function optionOr<T>(
  * Exported because {@link optionOr} is not the only place that names a value: an option with no
  * default warns and returns an inert result instead of falling back, and those call sites have to
  * spell the value the same way.
+ *
+ * Total, which `JSON.stringify` on its own is not — in both directions, and both of them are shapes
+ * a bad option arrives in. It answers with the *value* `undefined` for `undefined`, a function and a
+ * symbol, so the signature's `: string` was a lie and the warning it built said "got undefined"
+ * only by accident of template interpolation. And it *throws* on a circular object (a chart instance
+ * or a DOM node handed to an option expecting a scalar) and on a bigint — from inside a warning
+ * path, in a package whose stated policy is that nothing in `src/` throws. Both now degrade to the
+ * value's type name, which is little information but is information, and is a string.
  */
 export function describeValue(value: unknown): string {
-	return typeof value === 'number' ? String(value) : JSON.stringify(value);
+	if (typeof value === 'number' || typeof value === 'bigint') {
+		return String(value);
+	}
+
+	try {
+		return JSON.stringify(value) ?? typeof value;
+	} catch {
+		return typeof value;
+	}
 }
