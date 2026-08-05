@@ -1,6 +1,6 @@
 {
 	"name": "uplot-kit",
-	"version": "0.0.1",
+	"version": "0.1.0",
 	"description": "Framework-agnostic, typed, tested plugins & utilities for uPlot",
 	"license": "MIT",
 	"repository": {
