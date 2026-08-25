@@ -327,7 +327,7 @@ function generateLadder(
 
 // --- Ladders (private to this module) ---
 
-// Every ladder below is built at module scope so the 9 incrsFor* facades below can stay cheap
+// Every ladder below is built at module scope so the 12 incrsFor* facades below can stay cheap
 // wrappers (ladder lookup + optional min/maxIncr filter). The `/* @__PURE__ */` annotations are
 // load-bearing, not decorative: without them a bundler must conservatively assume
 // incrsLadder()/`.filter()` calls could have side effects, and keeps every ladder (bytes, bits,
@@ -360,6 +360,24 @@ const KILOBYTE_INCRS: readonly number[] = /* @__PURE__ */ incrsLadder(2, -10, 50
 // uplot peer range moves.
 /** Power-of-two increments for values measured in megabytes, resolving down to 16 bytes. */
 const MEGABYTE_INCRS: readonly number[] = /* @__PURE__ */ incrsLadder(2, -16, 50, [1]);
+
+// Identical to MEGABYTE_INCRS, and by the same rule rather than by coincidence: the label budget
+// above caps a base-2 rung at 2^-16 whatever unit the axis is scaled to, and every ladder from
+// megabytes up hits that cap before it reaches the rung that would spell a single byte (2^-20 in
+// megabytes, 2^-40 in terabytes, 2^-50 in petabytes). So these alias that ladder instead of
+// rebuilding it — one uPlot constant sets every one of those floors, and a fresh
+// `incrsLadder(2, -16, ...)` per unit would be one more place to keep in step if it ever moves.
+// The arrays coincide; the units they are read in do not, which is the whole of what the facades
+// add. That also marks where the family ends: a unit above petabytes would be a fourth alias of
+// the same numbers, and callers who need one can spell it `incrsLadder(2, -16, 50, [1])`.
+/** Power-of-two increments for values measured in gigabytes, resolving down to 16 KiB. */
+const GIGABYTE_INCRS: readonly number[] = MEGABYTE_INCRS;
+
+/** Power-of-two increments for values measured in terabytes, resolving down to 16 MiB. */
+const TERABYTE_INCRS: readonly number[] = MEGABYTE_INCRS;
+
+/** Power-of-two increments for values measured in petabytes, resolving down to 16 GiB. */
+const PETABYTE_INCRS: readonly number[] = MEGABYTE_INCRS;
 
 // uPlot's own default numeric ladder mixes in a 2.5 mantissa (…, 2, 2.5, 5, …), which produces
 // fractional ticks like 2.5 or 0.5 on an axis that only ever holds whole numbers. uPlot has an
@@ -476,8 +494,9 @@ const NANOSECOND_INCRS: readonly number[] = /* @__PURE__ */ buildNanosecondIncrs
 // --- Options + per-unit facades + dispatcher ---
 
 // Shared by every incrsFor* facade (and incrsByUnit, incrsStep) rather than given each its own
-// <Facade>Options type, unlike splits.ts's per-generator options — all nine facades take the same
-// minIncr/maxIncr shape, so a separate interface per facade would just be nine identical copies.
+// <Facade>Options type, unlike splits.ts's per-generator options — all twelve facades take the
+// same minIncr/maxIncr shape, so a separate interface per facade would just be twelve identical
+// copies.
 /**
  * Bounds on which rungs of a ladder an axis may pick, accepted by every `incrsFor*` facade, by
  * {@link incrsByUnit} and by {@link incrsStep}.
@@ -701,6 +720,98 @@ export function incrsForMegabytes(options?: IncrsOptions): number[] {
 }
 
 /**
+ * Power-of-two increments for a Y axis whose values are already scaled to gigabytes, resolving
+ * down to 16 KiB (2^-16 GB). The floor is the same rung {@link incrsForMegabytes} stops at, for
+ * the same reason — uPlot's increment picker rejects anything finer than 2^-16 whatever the unit —
+ * so it simply spells a coarser size here. Plot in megabytes or smaller if you need to tick below
+ * it.
+ * @example
+ * ```ts
+ * import uPlot from 'uplot';
+ * import { incrsForGigabytes } from 'uplot-kit';
+ *
+ * const start = Date.UTC(2026, 0, 1) / 1000; // axis values are Unix seconds
+ * const data: uPlot.AlignedData = [
+ *   [start, start + 60, start + 120],
+ *   [6, 48, 20]
+ * ];
+ *
+ * const opts: uPlot.Options = {
+ *   width: 800,
+ *   height: 400,
+ *   series: [{}, { label: 'disk used (GB)' }],
+ *   axes: [{}, { incrs: incrsForGigabytes() }]
+ * };
+ *
+ * new uPlot(opts, data, document.body);
+ * ```
+ */
+export function incrsForGigabytes(options?: IncrsOptions): number[] {
+	return applyIncrsOptions(GIGABYTE_INCRS, options);
+}
+
+/**
+ * Power-of-two increments for a Y axis whose values are already scaled to terabytes, resolving
+ * down to 16 MiB (2^-16 TB) — the same rung {@link incrsForGigabytes} and
+ * {@link incrsForMegabytes} stop at, since uPlot's increment picker rejects anything finer than
+ * 2^-16 whatever the unit. Plot in a smaller unit if you need to tick below it.
+ * @example
+ * ```ts
+ * import uPlot from 'uplot';
+ * import { incrsForTerabytes } from 'uplot-kit';
+ *
+ * const start = Date.UTC(2026, 0, 1) / 1000; // axis values are Unix seconds
+ * const data: uPlot.AlignedData = [
+ *   [start, start + 60, start + 120],
+ *   [3, 12, 7]
+ * ];
+ *
+ * const opts: uPlot.Options = {
+ *   width: 800,
+ *   height: 400,
+ *   series: [{}, { label: 'cluster storage (TB)' }],
+ *   axes: [{}, { incrs: incrsForTerabytes() }]
+ * };
+ *
+ * new uPlot(opts, data, document.body);
+ * ```
+ */
+export function incrsForTerabytes(options?: IncrsOptions): number[] {
+	return applyIncrsOptions(TERABYTE_INCRS, options);
+}
+
+/**
+ * Power-of-two increments for a Y axis whose values are already scaled to petabytes, resolving
+ * down to 16 GiB (2^-16 PB) — the same rung every ladder from {@link incrsForMegabytes} up stops
+ * at, since uPlot's increment picker rejects anything finer than 2^-16 whatever the unit. This is
+ * the largest unit the package names: above it the ladder would repeat itself under a new label,
+ * so build one with `incrsLadder(2, -16, 50, [1])` instead.
+ * @example
+ * ```ts
+ * import uPlot from 'uplot';
+ * import { incrsForPetabytes } from 'uplot-kit';
+ *
+ * const start = Date.UTC(2026, 0, 1) / 1000; // axis values are Unix seconds
+ * const data: uPlot.AlignedData = [
+ *   [start, start + 60, start + 120],
+ *   [2, 9, 5]
+ * ];
+ *
+ * const opts: uPlot.Options = {
+ *   width: 800,
+ *   height: 400,
+ *   series: [{}, { label: 'archive size (PB)' }],
+ *   axes: [{}, { incrs: incrsForPetabytes() }]
+ * };
+ *
+ * new uPlot(opts, data, document.body);
+ * ```
+ */
+export function incrsForPetabytes(options?: IncrsOptions): number[] {
+	return applyIncrsOptions(PETABYTE_INCRS, options);
+}
+
+/**
  * Decimal (SI) increments in bits — 1-2-5 per decade, not powers of two — for a network-
  * throughput axis, where round values are conventionally decimal (1 kbit, 2 kbit, 5 kbit, ...)
  * rather than binary.
@@ -880,6 +991,9 @@ export type IncrsByUnitKind =
 	| 'byte'
 	| 'kilobyte'
 	| 'megabyte'
+	| 'gigabyte'
+	| 'terabyte'
+	| 'petabyte'
 	| 'bit'
 	| 'integer'
 	| 'second'
@@ -891,6 +1005,9 @@ const INCRS_FACADES: Record<IncrsByUnitKind, (options?: IncrsOptions) => number[
 	byte: incrsForBytes,
 	kilobyte: incrsForKilobytes,
 	megabyte: incrsForMegabytes,
+	gigabyte: incrsForGigabytes,
+	terabyte: incrsForTerabytes,
+	petabyte: incrsForPetabytes,
 	bit: incrsForBits,
 	integer: incrsForIntegers,
 	second: incrsForSeconds,
@@ -911,7 +1028,8 @@ const INCRS_FACADES: Record<IncrsByUnitKind, (options?: IncrsOptions) => number[
  * where a call to `incrsByUnit` keeps every built-in ladder reachable in the bundle.
  *
  * @param kind Either one of the built-in families (`'byte'`, `'kilobyte'`, `'megabyte'`,
- *   `'bit'`, `'integer'`, `'second'`, `'millisecond'`, `'microsecond'`, `'nanosecond'`), or a
+ *   `'gigabyte'`, `'terabyte'`, `'petabyte'`, `'bit'`, `'integer'`, `'second'`,
+ *   `'millisecond'`, `'microsecond'`, `'nanosecond'`), or a
  *   custom array of increments. A custom array is sorted ascending, de-duplicated, and stripped of
  *   values that are not finite and above zero, rather than trusted: this is the entry point whose
  *   argument arrives unchecked from a chart config, and each of those shapes otherwise fails as a

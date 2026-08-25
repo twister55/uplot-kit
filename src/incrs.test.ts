@@ -4,13 +4,16 @@ import {
 	incrsByUnit,
 	incrsForBits,
 	incrsForBytes,
+	incrsForGigabytes,
 	incrsForIntegers,
 	incrsForKilobytes,
 	incrsForMegabytes,
 	incrsForMicroseconds,
 	incrsForMilliseconds,
 	incrsForNanoseconds,
+	incrsForPetabytes,
 	incrsForSeconds,
+	incrsForTerabytes,
 	incrsLadder,
 	incrsStep,
 	type IncrsByUnitKind
@@ -271,6 +274,9 @@ const FACADES: Record<IncrsByUnitKind, () => number[]> = {
 	byte: incrsForBytes,
 	kilobyte: incrsForKilobytes,
 	megabyte: incrsForMegabytes,
+	gigabyte: incrsForGigabytes,
+	terabyte: incrsForTerabytes,
+	petabyte: incrsForPetabytes,
 	bit: incrsForBits,
 	integer: incrsForIntegers,
 	second: incrsForSeconds,
@@ -387,15 +393,35 @@ describe('incrsFor* facades', () => {
 		});
 	});
 
-	describe('incrsForKilobytes / incrsForMegabytes', () => {
-		it('resolves down to a single byte in kilobytes, and to 16 bytes in megabytes', () => {
+	describe('the binary ladders above bytes', () => {
+		it('resolves down to a single byte in kilobytes, and to 2^-16 of every unit above that', () => {
 			// The megabyte floor is not 2^-20: uPlot cannot pick a rung that fine on a megabyte-scaled
 			// axis at any zoom, so the ladder stops where it stops being usable. See the
 			// selectability test above for the arithmetic.
 			expect(Math.min(...incrsForKilobytes())).toBe(2 ** -10);
 			expect(Math.min(...incrsForMegabytes())).toBe(2 ** -16);
+			// The same cap further up, since it is uPlot's label budget that sets it and not the
+			// scale: that rung spells 16 bytes in megabytes and 16 GiB in petabytes.
+			expect(Math.min(...incrsForGigabytes())).toBe(2 ** -16);
+			expect(Math.min(...incrsForTerabytes())).toBe(2 ** -16);
+			expect(Math.min(...incrsForPetabytes())).toBe(2 ** -16);
 			expect(incrsForKilobytes()).toContain(1024);
 			expect(incrsForMegabytes()).toContain(1024);
+			expect(incrsForGigabytes()).toContain(1024);
+			expect(incrsForTerabytes()).toContain(1024);
+			expect(incrsForPetabytes()).toContain(1024);
+		});
+
+		it('gives every unit above megabytes the megabyte ladder, without sharing the array', () => {
+			// The four coincide by the rule above, so this pins the coincidence rather than letting
+			// a future divergence pass unnoticed -- and pins that the shared module-level ladder is
+			// still copied per call, so one consumer's mutation cannot reach another chart.
+			expect(incrsForGigabytes()).toStrictEqual(incrsForMegabytes());
+			expect(incrsForTerabytes()).toStrictEqual(incrsForMegabytes());
+			expect(incrsForPetabytes()).toStrictEqual(incrsForMegabytes());
+			expect(incrsForGigabytes()).not.toBe(incrsForMegabytes());
+			expect(incrsForTerabytes()).not.toBe(incrsForGigabytes());
+			expect(incrsForPetabytes()).not.toBe(incrsForTerabytes());
 		});
 	});
 
@@ -603,7 +629,7 @@ describe('incrsByUnit', () => {
 
 	// This is the module's runtime-dispatch entry point, so its argument is exactly the one that
 	// can arrive unvalidated from a chart config -- and TypeScript can't help there.
-	it.each(['gigabyte', 'valueOf', 'toString', 'constructor', '__proto__'])(
+	it.each(['minute', 'valueOf', 'toString', 'constructor', '__proto__'])(
 		'warns and yields no increments for the unrecognised kind %s',
 		(kind) => {
 			// Not a throw: this is the entry point whose argument arrives from a chart config, so a

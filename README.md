@@ -117,15 +117,15 @@ new uPlot(opts, data, document.body);
 
 Ladders of "nice" increments, so uPlot picks `15m` / `1h` / `1 KiB` rather than `16.67m` or `1023`.
 
-| Export                                                                                              | What it gives you                                               |
-| --------------------------------------------------------------------------------------------------- | --------------------------------------------------------------- |
-| `incrsForBytes()` · `incrsForKilobytes()` · `incrsForMegabytes()`                                   | Power-of-two ladders — ticks land on 1 KiB / 1 MiB, not 1000    |
-| `incrsForBits()`                                                                                    | Decimal SI 1-2-5 ladder, the convention for throughput          |
-| `incrsForIntegers()`                                                                                | Whole numbers only (1, 2, 5, 10, 20, 25, 50 …) — never a `2.5`  |
-| `incrsForSeconds()` · `incrsForMilliseconds()` · `incrsForMicroseconds()` · `incrsForNanoseconds()` | Wall-clock ladders from 1 ns to 100 years: 5m, 15m, 1h, 1d, …   |
-| `incrsByUnit(kind, opts?)`                                                                          | Runtime dispatcher over all nine, or a custom (sanitized) array |
-| `incrsStep(step, opts?)`                                                                            | Exact multiples of a fixed bucket — 15-minute candles, 7m polls |
-| `incrsLadder(base, minExp, maxExp, mantissas)`                                                      | The engine: build your own `mantissa × base^exp` ladder         |
+| Export                                                                                                                                    | What it gives you                                                 |
+| ----------------------------------------------------------------------------------------------------------------------------------------- | ----------------------------------------------------------------- |
+| `incrsForBytes()` · `incrsForKilobytes()` · `incrsForMegabytes()` · `incrsForGigabytes()` · `incrsForTerabytes()` · `incrsForPetabytes()` | Power-of-two ladders — ticks land on 1 KiB / 1 MiB, not 1000      |
+| `incrsForBits()`                                                                                                                          | Decimal SI 1-2-5 ladder, the convention for throughput            |
+| `incrsForIntegers()`                                                                                                                      | Whole numbers only (1, 2, 5, 10, 20, 25, 50 …) — never a `2.5`    |
+| `incrsForSeconds()` · `incrsForMilliseconds()` · `incrsForMicroseconds()` · `incrsForNanoseconds()`                                       | Wall-clock ladders from 1 ns to 100 years: 5m, 15m, 1h, 1d, …     |
+| `incrsByUnit(kind, opts?)`                                                                                                                | Runtime dispatcher over all twelve, or a custom (sanitized) array |
+| `incrsStep(step, opts?)`                                                                                                                  | Exact multiples of a fixed bucket — 15-minute candles, 7m polls   |
+| `incrsLadder(base, minExp, maxExp, mantissas)`                                                                                            | The engine: build your own `mantissa × base^exp` ladder           |
 
 Every ladder takes `{ minIncr, maxIncr }`, to clamp it to the resolution your data actually has:
 
@@ -248,7 +248,7 @@ These aren't aspirations — they're the constraints every unit in the package i
 - **🪶 Zero runtime dependencies.** `uplot` is the only peer. `throttle`/`clamp`-sized helpers get
   inlined at the point of use; ESLint fails the build on an extraneous import.
 - **🌲 Tree-shakeable by construction.** ESM, `sideEffects: false`, named exports only. Import
-  `incrsForBytes` and the other eight ladders never reach your bundle.
+  `incrsForBytes` and the other eleven ladders never reach your bundle.
 - **🧯 Nothing in `src/` throws.** A bad option that has a documented default is named, warned about
   **once** on the console, and replaced by the default. A bad _required_ value produces the inert
   result — no ticks, no increments. A chart-config typo costs an axis, not the page.
