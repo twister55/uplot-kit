@@ -59,36 +59,70 @@ describe('stackedData', () => {
 		expect(stackedData([[100], [1], [2]])).toEqual([[100], [1], [3]]);
 	});
 
-	it('treats null as zero', () => {
+	it('keeps a null gap as a gap, and counts it as zero toward the series above', () => {
 		const [, first, second] = stackedData([
 			[100, 200],
 			[1, null],
 			[10, 20]
 		]);
 
-		expect(first).toEqual([1, 0]);
+		expect(first).toEqual([1, null]);
 		expect(second).toEqual([11, 20]);
 	});
 
-	it('treats undefined as zero — gaps from uPlot.join do not poison series above', () => {
+	it('keeps an undefined gap as a gap — holes from uPlot.join do not poison series above', () => {
 		const [, first, second] = stackedData([
 			[100, 200],
 			[1, undefined],
 			[10, 20]
 		]);
 
-		expect(first).toEqual([1, 0]);
+		expect(first).toEqual([1, null]);
 		expect(second).toEqual([11, 20]);
 	});
 
-	it('treats NaN as zero — gaps in typed-array rows do not cascade upward', () => {
-		const [, , second] = stackedData([
+	it('keeps a NaN gap as a gap — the output marker is null, since output rows are plain arrays', () => {
+		const [, first, second] = stackedData([
 			new Float64Array([100, 200]),
 			new Float64Array([1, NaN]),
 			new Float64Array([5, 5])
 		]);
 
+		expect(first).toEqual([1, null]);
 		expect(second).toEqual([6, 5]);
+	});
+
+	it('does not continue a top series across its gap along the stack below it', () => {
+		const [, bottom, top] = stackedData([
+			[0, 1],
+			[10, 10],
+			[5, null]
+		]);
+
+		expect(bottom).toEqual([10, 10]);
+		expect(top).toEqual([15, null]);
+	});
+
+	it('resumes a series with the correct running total after a gap in its middle', () => {
+		const [, bottom, top] = stackedData([
+			[0, 1, 2, 3],
+			[1, 1, 1, 1],
+			[2, null, 2, 2]
+		]);
+
+		expect(bottom).toEqual([1, 1, 1, 1]);
+		expect(top).toEqual([3, null, 3, 3]);
+	});
+
+	it('dips the series above a gap in a lower series, rather than breaking it', () => {
+		const [, bottom, top] = stackedData([
+			[0, 1],
+			[5, null],
+			[10, 10]
+		]);
+
+		expect(bottom).toEqual([5, null]);
+		expect(top).toEqual([15, 10]);
 	});
 
 	it('returns new arrays without mutating the source data', () => {
@@ -119,8 +153,9 @@ describe('stackedData', () => {
 		]);
 
 		expect(xs).toEqual([100, 200, 300]);
-		expect(shorter).toHaveLength(3);
-		expect(longer).toHaveLength(3);
+		// The short row runs out into a gap, not a repeat of the running total.
+		expect(shorter).toEqual([1, 1, null]);
+		expect(longer).toEqual([3, 3, 2]);
 	});
 
 	it('works with empty rows', () => {

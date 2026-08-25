@@ -21,11 +21,15 @@ export interface StackedDataOptions {
 /**
  * Transforms aligned series data for a stacked-area chart: series `i` (1-based —
  * index 0 is the x values) becomes the running sum of series `1..i`, so uPlot can
- * plot each series as the top edge of its own band. Gaps count as 0 toward the
- * running total, whatever their encoding — `null`, `undefined` (what `uPlot.join`
- * fills holes with), or `NaN` (the only gap representation typed-array rows have) —
- * so one series' missing sample never corrupts the series stacked above it. A
- * `seriesIdx` excluded via {@link StackedDataOptions.omit} keeps its raw values and is
+ * plot each series as the top edge of its own band.
+ *
+ * A gap — `null`, `undefined` (what `uPlot.join` fills holes with, and what a short
+ * row runs out into) or `NaN` (what typed-array rows use) — stays a gap in its own
+ * series, emitted as `null` so uPlot draws a hole rather than a line along the top
+ * edge of the stack below. It counts as 0 toward the running total, so the series
+ * above dip by the missing sample instead of inheriting the gap.
+ *
+ * A `seriesIdx` excluded via {@link StackedDataOptions.omit} keeps its raw values and is
  * left out of the running total for every series above it.
  *
  * Every output row is a fresh array; the input is never mutated.
@@ -80,8 +84,14 @@ export function stackedData(
 			return Array.from({ length: xLen }, (_, j) => row[j]);
 		}
 		return Array.from({ length: xLen }, (_, j) => {
-			const n = Number(row[j]);
-			const next = (accum[j] ?? 0) + (Number.isNaN(n) ? 0 : n);
+			const v = row[j];
+			const n = Number(v);
+			// Emitting the running total here would draw the series across the hole, along the
+			// top edge of the stack below. `Number(null)` is 0, hence the separate null test.
+			if (v == null || Number.isNaN(n)) {
+				return null;
+			}
+			const next = (accum[j] ?? 0) + n;
 			accum[j] = next;
 			return next;
 		});
