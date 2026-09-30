@@ -32,7 +32,7 @@ describe('stackedData', () => {
 		expect(third).toEqual([3, 3]);
 	});
 
-	it('preserves null gaps in an omitted series: raw values are not rewritten', () => {
+	it('leaves null gaps in an omitted series as they are', () => {
 		const [, omitted] = stackedData(
 			[
 				[100, 200],
@@ -59,40 +59,39 @@ describe('stackedData', () => {
 		expect(stackedData([[100], [1], [2]])).toEqual([[100], [1], [3]]);
 	});
 
-	it('keeps a null gap as a gap, and counts it as zero toward the series above', () => {
-		const [, first, second] = stackedData([
-			[100, 200],
-			[1, null],
-			[10, 20]
+	it('holds the running total across a gap in a middle series, leaving every row dense', () => {
+		const [, first, second, third] = stackedData([
+			[0, 1, 2, 3],
+			[10, 10, 10, 10],
+			[10, null, null, 10],
+			[10, 10, 10, 10]
 		]);
 
-		expect(first).toEqual([1, null]);
-		expect(second).toEqual([11, 20]);
+		expect(first).toEqual([10, 10, 10, 10]);
+		// the gap emits the level of the series below it, not a hole and not 0
+		expect(second).toEqual([20, 10, 10, 20]);
+		// the series above keeps its own thickness, dipping by exactly the missing sample
+		expect(third).toEqual([30, 20, 20, 30]);
 	});
 
-	it('keeps an undefined gap as a gap — holes from uPlot.join do not poison series above', () => {
-		const [, first, second] = stackedData([
-			[100, 200],
-			[1, undefined],
-			[10, 20]
+	it('emits the baseline for a gap in the lowest series, so the series above fills to it', () => {
+		// the reported case: a hole in the bottom series erased the band of the one above it
+		const [, first, second, third] = stackedData([
+			[0, 1, 2, 3, 4, 5],
+			[10, 10, null, null, 10, 10],
+			[10, 10, 10, 10, 10, 10],
+			[10, 10, 10, 10, 10, 10]
 		]);
 
-		expect(first).toEqual([1, null]);
-		expect(second).toEqual([11, 20]);
+		expect(first).toEqual([10, 10, 0, 0, 10, 10]);
+		expect(second).toEqual([20, 20, 10, 10, 20, 20]);
+		expect(third).toEqual([30, 30, 20, 20, 30, 30]);
 	});
 
-	it('keeps a NaN gap as a gap — the output marker is null, since output rows are plain arrays', () => {
-		const [, first, second] = stackedData([
-			new Float64Array([100, 200]),
-			new Float64Array([1, NaN]),
-			new Float64Array([5, 5])
-		]);
-
-		expect(first).toEqual([1, null]);
-		expect(second).toEqual([6, 5]);
-	});
-
-	it('does not continue a top series across its gap along the stack below it', () => {
+	it('holds a gapped top series along the stack below it too — the rule is uniform', () => {
+		// Nothing is banded above the top series, so this gap would erase no fill and the held
+		// line buys nothing here. It is held anyway, on purpose: stackedData's JSDoc says why the
+		// rule deliberately does not ask whether a band is drawn above a given gap.
 		const [, bottom, top] = stackedData([
 			[0, 1],
 			[10, 10],
@@ -100,29 +99,131 @@ describe('stackedData', () => {
 		]);
 
 		expect(bottom).toEqual([10, 10]);
-		expect(top).toEqual([15, null]);
-	});
-
-	it('resumes a series with the correct running total after a gap in its middle', () => {
-		const [, bottom, top] = stackedData([
-			[0, 1, 2, 3],
-			[1, 1, 1, 1],
-			[2, null, 2, 2]
-		]);
-
-		expect(bottom).toEqual([1, 1, 1, 1]);
-		expect(top).toEqual([3, null, 3, 3]);
-	});
-
-	it('dips the series above a gap in a lower series, rather than breaking it', () => {
-		const [, bottom, top] = stackedData([
-			[0, 1],
-			[5, null],
-			[10, 10]
-		]);
-
-		expect(bottom).toEqual([5, null]);
 		expect(top).toEqual([15, 10]);
+	});
+
+	it('supports the documented hole recipe: re-punch the topmost stacked row from its raw gaps', () => {
+		const rawTop: Array<number | null> = [5, null, NaN, 5];
+		const result = stackedData([[0, 1, 2, 3], [10, 10, 10, 10], rawTop, [7, 7, null, 7]], {
+			omit: (i) => i === 3
+		});
+
+		// Series 3 is omitted, so it is not part of the stack: it keeps its raw values and its own
+		// gap, and the top of the *stack* is series 2 — the row the recipe applies to. That is why
+		// the README says "topmost stacked series" and not "the last accumulated row".
+		expect(result[3]).toEqual([7, 7, null, 7]);
+
+		const top = result[2] as number[];
+		expect(top).toEqual([15, 10, 10, 15]);
+
+		// The recipe as documented, gap test included: `== null` alone would miss the NaN, which
+		// stackedData held the total across like any other gap. Nothing is banded above the topmost
+		// stacked series, so punching its gaps back in erases no neighbour's fill.
+		const isGap = (v: number | null | undefined) => v == null || !Number.isFinite(v);
+		expect(top.map((v, j) => (isGap(rawTop[j]) ? null : v))).toEqual([15, null, null, 15]);
+	});
+
+	it("a gap in the lowest series emits a real 0, outside that series' own data range", () => {
+		const [, first] = stackedData([
+			[0, 1, 2, 3],
+			[100, 105, null, 102]
+		]);
+
+		// Not a marker uPlot ignores: 0 is a value it scales, so the y range now reaches down to
+		// it. stackedData's JSDoc says what that does on a linear and on a log scale.
+		expect(first).toEqual([100, 105, 0, 102]);
+	});
+
+	it('cannot distinguish a measured 0 from a gap — read the raw row if you need to', () => {
+		const [, sampled] = stackedData([
+			[0, 1],
+			[0, null]
+		]);
+
+		// Cell 0 is 0 because the series measured 0; cell 1 is 0 because no sample exists and the
+		// running total below it is 0. Nothing in the output separates them, which is why the
+		// documented hole recipe works off the raw row rather than this one.
+		expect(sampled).toEqual([0, 0]);
+	});
+
+	it.each([
+		['leading', [null, null, 10, 10], [0, 0, 10, 10], [10, 10, 20, 20]],
+		['trailing', [10, 10, null, null], [10, 10, 0, 0], [20, 20, 10, 10]]
+	])('holds the total across %s gaps', (_label, gapped, expectedFirst, expectedSecond) => {
+		const [, first, second] = stackedData([[0, 1, 2, 3], gapped, [10, 10, 10, 10]]);
+
+		expect(first).toEqual(expectedFirst);
+		expect(second).toEqual(expectedSecond);
+	});
+
+	it.each<[string, Array<number | null | undefined> | Float64Array]>([
+		['null', [10, null]],
+		['undefined — a hole from uPlot.join', [10, undefined]],
+		['NaN — the gap marker of a typed-array row', new Float64Array([10, NaN])],
+		['Infinity — a rate divided by zero', [10, Infinity]],
+		['-Infinity', [10, -Infinity]]
+	])('treats %s as a gap', (_label, gapped) => {
+		const [, first, second] = stackedData([[0, 1], gapped, [10, 10]]);
+
+		expect(first).toEqual([10, 0]);
+		// Folded in rather than screened, a non-finite value would poison the total for every
+		// series above it.
+		expect(second).toEqual([20, 10]);
+	});
+
+	it('emits the baseline for every series of a column that is a gap throughout', () => {
+		const [, first, second] = stackedData([
+			[0, 1, 2],
+			[10, null, 10],
+			[10, null, 10]
+		]);
+
+		expect(first).toEqual([10, 0, 10]);
+		expect(second).toEqual([20, 0, 20]);
+	});
+
+	it('re-spells NaN and ±Infinity as null in an omitted series — uPlot would read them as values', () => {
+		const [, omitted] = stackedData(
+			[
+				[0, 1, 2, 3, 4],
+				[5, NaN, Infinity, -Infinity, 5]
+			],
+			{ omit: (i) => i === 1 }
+		);
+
+		// uPlot's gap test is `v != null`, so left here these are values. The Infinity alone turns
+		// the y range into NaN, and the NaN would too whenever a zoom made it the first point in
+		// view — a blank chart, not a hole in one series.
+		expect(omitted).toEqual([5, null, null, null, 5]);
+	});
+
+	it('leaves undefined in an omitted series as undefined, not null', () => {
+		const [, omitted] = stackedData(
+			[
+				[0, 1, 2],
+				[5, undefined, 5]
+			],
+			{ omit: (i) => i === 1 }
+		);
+
+		// toStrictEqual, since toEqual reads undefined and a missing element as the same thing.
+		expect(omitted).toStrictEqual([5, undefined, 5]);
+	});
+
+	it('aligns an omitted row to the x row length too, shorter or longer', () => {
+		const [xs, shorter, longer] = stackedData(
+			[
+				[100, 200, 300],
+				[1, 1],
+				[2, 2, 2, 2]
+			],
+			{ omit: () => true }
+		);
+
+		expect(xs).toEqual([100, 200, 300]);
+		// The short row runs out into `undefined` — a real element, not a hole in the array.
+		expect(shorter).toStrictEqual([1, 1, undefined]);
+		expect(longer).toStrictEqual([2, 2, 2]);
 	});
 
 	it('returns new arrays without mutating the source data', () => {
@@ -153,8 +254,8 @@ describe('stackedData', () => {
 		]);
 
 		expect(xs).toEqual([100, 200, 300]);
-		// The short row runs out into a gap, not a repeat of the running total.
-		expect(shorter).toEqual([1, 1, null]);
+		// The short row runs out into a gap, which holds the running total like any other.
+		expect(shorter).toEqual([1, 1, 0]);
 		expect(longer).toEqual([3, 3, 2]);
 	});
 

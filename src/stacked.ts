@@ -10,12 +10,27 @@ export type SeriesPredicate = (seriesIdx: number) => boolean;
 export interface StackedDataOptions {
 	/**
 	 * Return `true` to exclude series `seriesIdx` from the stack: it keeps its own raw
-	 * values (returned as a fresh copy, `null` gaps intact), and — since it never joins
-	 * the running total — later series stack as if it weren't there at all. Typically
-	 * driven by legend/series visibility state.
+	 * values (returned as a fresh copy, `null` and `undefined` gaps intact), and — since it
+	 * never joins the running total — later series stack as if it weren't there at all.
+	 * Typically driven by legend/series visibility state.
+	 *
+	 * One value is not passed through: `NaN` and `±Infinity` come back as `null`, since uPlot
+	 * would read either as a value rather than a gap — see {@link stackedData}.
 	 * @default () => false
 	 */
 	omit?: SeriesPredicate;
+}
+
+// The one definition of a gap in this file: a sample's numeric value, or `null` when there is no
+// reading — `null`, `undefined`, or anything non-finite. `±Infinity` counts because it is the same
+// kind of non-reading as `NaN`, and folded into the running total it would poison that column for
+// every series above.
+function readingOf(v: number | null | undefined): number | null {
+	if (v == null) {
+		return null;
+	}
+	const n = Number(v);
+	return Number.isFinite(n) ? n : null;
 }
 
 /**
@@ -23,14 +38,54 @@ export interface StackedDataOptions {
  * index 0 is the x values) becomes the running sum of series `1..i`, so uPlot can
  * plot each series as the top edge of its own band.
  *
- * A gap — `null`, `undefined` (what `uPlot.join` fills holes with, and what a short
- * row runs out into) or `NaN` (what typed-array rows use) — stays a gap in its own
- * series, emitted as `null` so uPlot draws a hole rather than a line along the top
- * edge of the stack below. It counts as 0 toward the running total, so the series
- * above dip by the missing sample instead of inheriting the gap.
+ * A gap — `null`, `undefined` (what `uPlot.join` fills holes with, and what a short row runs out
+ * into), or any non-finite number: `NaN` (what typed-array rows use) and `±Infinity` (what a rate
+ * divided by zero produces) — counts as 0 toward the running total, so the series above it dip by
+ * the missing sample instead of inheriting the gap. The non-finite ones are not gaps to uPlot
+ * itself, whose test is `v != null`: left in place, an `Infinity` anywhere in view, or a `NaN` that
+ * is the first sample in view, turns the whole scale range into `NaN` and blanks the entire chart —
+ * and "first in view" moves with zoom, so the `NaN` case comes and goes. Normalising them here is
+ * what keeps that local. A gap's own series holds the running total across it rather than emitting
+ * `null`, so every *accumulated* row is dense — a series excluded by {@link
+ * StackedDataOptions.omit} keeps its raw gaps and is the one exception.
  *
- * A `seriesIdx` excluded via {@link StackedDataOptions.omit} keeps its raw values and is
- * left out of the running total for every series above it.
+ * That is the same choice Plotly makes by default for a stacked area (`stackgaps: 'infer zero'`,
+ * whose only alternative is `'interpolate'` — there is no "leave a hole" setting), and here it is
+ * not a free one: uPlot clips a band's fill by the gaps of the series *below* it, so a hole in one
+ * series would erase the filled area of its upper neighbour, which still has data there. Libraries
+ * that do show holes in a stack get them by filling every series to the baseline and painting back
+ * to front; uPlot fills each band to the previous series' path instead, so that option is closed.
+ *
+ * The rule is uniform and deliberately does not ask whether a band is actually drawn above a given
+ * gap. So a gapped series is drawn as a line lying on its lower neighbour (on the baseline, for the
+ * lowest series) instead of breaking, and a column where *no* series has data puts every line on
+ * the baseline with its bands collapsed to nothing — both expected, not a failure. For a genuine
+ * hole where the topmost *stacked* series has no data — the one place uPlot can render one without
+ * erasing anything — write `null` back into that series' own accumulated row wherever its raw row
+ * was a gap, which by the definition above is `v == null || !Number.isFinite(v)`, not `null` alone.
+ * "Topmost stacked", not "last row": an omitted series sits in the output at its own index without
+ * being part of the stack.
+ *
+ * Two properties of the emitted numbers are worth knowing before reading them back. They are
+ * *lossy*: a `0` in an accumulated row means either "the running total here is 0" or "no sample",
+ * and nothing distinguishes the two — not for a tooltip, legend or export of yours, and not for
+ * uPlot, which treats a gap cell as a sample like any other: it paints a point marker there
+ * whenever the series shows points (`points.show`, or on its own once the data is sparse enough),
+ * snaps the hover point to it and prints the held total in the legend. Whatever has to tell them
+ * apart must read the raw row alongside — the same row, and the same test, the hole recipe above
+ * needs. For uPlot's own drawing that is two options: `series.points.filter` returning only the
+ * indices whose raw sample is a reading (and `null` when its `show` argument is false), and
+ * `cursor.dataIdx` returning `null` for a gap, which hides the hover point and empties that series'
+ * legend value.
+ *
+ * And a gap in the *lowest* series emits a genuine `0`, which uPlot scales like any other value.
+ * On a linear y scale the auto-range is therefore pinned to include zero — `[100, 105, null, 102]`
+ * ranges 0..105, not 100..105 — which is usually what a stacked area wants anyway, since its areas
+ * are read from the baseline. On a log scale (`distr: 3`) the *range* is unaffected, because uPlot
+ * ranges log scales over positive values only, but the point still has to be placed: uPlot clamps
+ * a non-positive value to one decade below the scale minimum, so the gap plunges off the bottom of
+ * the plot area and comes back rather than breaking the path. Give such a scale an explicit
+ * `range`, or keep gaps out of the bottom series.
  *
  * Every output row is a fresh array; the input is never mutated.
  *
@@ -79,22 +134,29 @@ export function stackedData(
 	// row shorter or longer than the x row can never desync the running total or produce
 	// a misaligned output row.
 	const result = yRows.map((row, i) => {
-		const seriesIdx = i + 1;
-		if (omit(seriesIdx)) {
-			return Array.from({ length: xLen }, (_, j) => row[j]);
-		}
-		return Array.from({ length: xLen }, (_, j) => {
-			const v = row[j];
-			const n = Number(v);
-			// Emitting the running total here would draw the series across the hole, along the
-			// top edge of the stack below. `Number(null)` is 0, hence the separate null test.
-			if (v == null || Number.isNaN(n)) {
-				return null;
+		const out = new Array<number | null | undefined>(xLen);
+		if (omit(i + 1)) {
+			// Raw values, with the one translation an excluded series still needs: a non-finite
+			// sample becomes `null`. `null` and `undefined` pass through as they are — uPlot already
+			// reads both as gaps.
+			for (let j = 0; j < xLen; j++) {
+				const v = row[j];
+				out[j] = v == null ? v : readingOf(v);
 			}
-			const next = (accum[j] ?? 0) + n;
-			accum[j] = next;
-			return next;
-		});
+			return out;
+		}
+		// A gap counts as 0, so its cell holds the running total rather than `null` — uPlot would
+		// clip the upper neighbour's band by that `null`; the JSDoc says how. Unconditionally so:
+		// emitting `null` only where a gap reaches the top of the stack was considered and rejected
+		// twice over. No charting library behaves that way, so the result would be unpredictable to
+		// everyone who has not read this file; and what counts as the top is decided by which
+		// series are banded, so it would silently depend on `stackedBands` getting the same `omit`.
+		for (let j = 0; j < xLen; j++) {
+			const total = (accum[j] ?? 0) + (readingOf(row[j]) ?? 0);
+			accum[j] = total;
+			out[j] = total;
+		}
+		return out;
 	});
 
 	return [Array.from(xRow), ...result] as uPlot.AlignedData;

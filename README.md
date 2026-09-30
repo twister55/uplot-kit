@@ -209,9 +209,53 @@ new uPlot(opts, stackedData(raw), document.body);
 ```
 
 `stackedData` turns each series into the running sum of the ones below it — gaps count as `0`
-whatever their encoding (`null`, `undefined` or `NaN`), so one missing sample never corrupts the
-series stacked above it, and the input is never mutated. `stackedBands` pairs each series with the
-one beneath it, carrying no `fill` of its own so color stays a per-series choice.
+whatever their encoding (`null`, `undefined`, `NaN` or `±Infinity`), so one missing sample never
+corrupts the series stacked above it, and the input is never mutated. The non-finite ones matter
+more than they look: uPlot's own gap test is `v != null`, so a stray `NaN` or `Infinity` left in the
+data is a _value_ to it. An `Infinity` anywhere in view, or a `NaN` that happens to be the first
+point in view, turns the whole y range into `NaN` and blanks the chart rather than the one point —
+and since "first in view" changes with zoom, the `NaN` case comes and goes. `stackedData` treats
+them as gaps like the rest; in a series excluded by `omit`, which otherwise keeps its raw values,
+they come back as `null`. `stackedBands` pairs each series with the one beneath it, carrying no
+`fill` of its own so color stays a per-series choice.
+
+A gap's own series holds the running total across it, so every _accumulated_ row is dense (a series
+excluded by `omit` keeps its raw gaps). That is the same choice Plotly makes by default for a
+stacked area — `stackgaps: 'infer zero'`, whose only alternative is `'interpolate'`; there is no
+"leave a hole" setting — and here it is not a free one. uPlot turns a series' gaps into a clip path
+and applies it to the **band fill of the series above**, so a hole in one series would erase the
+filled area of its upper neighbour, which still has data there. A line or spline neighbour keeps its
+stroke; one drawn with `uPlot.paths.bars` loses that too. Libraries that _do_ show holes in a stack
+(ECharts, Chart.js with `fill: 'origin'`) get them for free by filling every series to the baseline
+and painting back to front; uPlot fills each band to the previous series' path instead, so that
+option is not on the table.
+
+The rule is uniform: it does not ask whether a band is actually drawn above a given gap. So a gapped
+series is drawn as a line lying on its lower neighbour rather than breaking, and a column where _no_
+series has data puts every line on the baseline with its bands collapsed to nothing. Both are
+expected, not a failure. For a genuine hole where the topmost _stacked_ series has no data — the one
+place uPlot can render one without erasing anything — write `null` back into that series' own
+accumulated row wherever its raw row was a gap, which means `v == null || !Number.isFinite(v)`, not
+`null` alone. Note "topmost stacked", not "last row": a series excluded by `omit` sits in the output
+at its own index without being part of the stack.
+
+Read the accumulated rows back with two things in mind. They are lossy: a `0` in one means either
+"the running total here is 0" or "no sample", and nothing tells the two apart — not for your own
+tooltip, legend or export, and not for uPlot, which treats a gap cell as a sample like any other. It
+paints a point marker there whenever the series shows points (`points.show`, or on its own once the
+data is sparse enough), snaps the hover point to it and prints the held total in the legend.
+Whatever has to tell them apart should read the raw row alongside, with the same test the recipe
+above uses. For uPlot's own drawing that is two options: `series.points.filter` returning only the
+indices whose raw sample is a reading (and `null` when its `show` argument is false), and
+`cursor.dataIdx` returning `null` for a gap, which hides the hover point and empties that series'
+legend value.
+
+And a gap in the _lowest_ series emits a genuine `0`, which uPlot scales like any other value, so
+`[100, 105, null, 102]` gives a linear y range of 0..105 rather than 100..105 — usually what a
+stacked area wants, since its areas are read from the baseline. On a log scale (`distr: 3`) the
+range is unaffected (uPlot ranges log scales over positive values only), but the point still gets
+placed one decade below the scale minimum, so the gap plunges off the bottom of the plot and comes
+back. Give that scale an explicit `range`, or keep gaps out of the bottom series.
 
 Both take the same `omit` predicate, so a series hidden in your legend drops out of the stack and
 the rest re-stack as if it were never there:
